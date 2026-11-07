@@ -34,7 +34,7 @@
  * it the card still shows the video and plays the sound.
  */
 
-const CARD_VERSION = "0.1.0";
+const CARD_VERSION = "0.1.1";
 const DOMAIN = "ajax_doorbell";
 
 const KEEPALIVE_MS = 60000; // re-answer during our call: the integration ends unattended calls
@@ -1178,8 +1178,73 @@ const TEMPLATE = `
   </ha-card>
 `;
 
+/* Visual editor: Home Assistant draws the form from this schema (getConfigForm). */
+const EDITOR_LABELS = {
+  fr: {
+    camera: "Caméra de la sonnette",
+    name: "Nom affiché",
+    answered_by: "Nom de cet écran (« Décroché sur … »)",
+    preview_on_ring: "Vidéo en muet dès la sonnerie",
+    ring_sound: "Sonnerie dans le navigateur",
+    fullscreen_on_ring: "Plein écran à la sonnerie",
+    push_to_talk: "Maintenir pour parler",
+    show_stats: "Statistiques (délai, codecs)",
+    auto_retry: "Reconnexion automatique",
+    aspect_ratio: "Format de l'image (ex. 16 / 9)",
+    options: "Options",
+  },
+  en: {
+    camera: "Doorbell camera",
+    name: "Displayed name",
+    answered_by: "Name of this screen (\"Answered on …\")",
+    preview_on_ring: "Muted video as soon as it rings",
+    ring_sound: "Ringtone in the browser",
+    fullscreen_on_ring: "Full screen when it rings",
+    push_to_talk: "Hold to talk",
+    show_stats: "Statistics (delay, codecs)",
+    auto_retry: "Reconnect automatically",
+    aspect_ratio: "Picture shape (e.g. 16 / 9)",
+    options: "Options",
+  },
+};
+
+function editorLabel(name) {
+  const lang = ((typeof document !== "undefined" && document.documentElement.lang) || "en").slice(0, 2);
+  const table = EDITOR_LABELS[lang] || EDITOR_LABELS.en;
+  return table[name] || EDITOR_LABELS.en[name] || name;
+}
+
 class AjaxDoorbellCard extends HTMLElement {
   /* ---------- Lovelace API ---------- */
+
+  static getConfigForm() {
+    const toggle = (name) => ({ name, selector: { boolean: {} } });
+    return {
+      schema: [
+        {
+          name: "camera",
+          required: true,
+          selector: { entity: { filter: { domain: "camera", integration: DOMAIN } } },
+        },
+        { name: "name", selector: { text: {} } },
+        { name: "answered_by", selector: { text: {} } },
+        {
+          type: "expandable",
+          name: "",
+          title: editorLabel("options"),
+          schema: [
+            {
+              type: "grid",
+              name: "",
+              schema: ["preview_on_ring", "ring_sound", "fullscreen_on_ring", "push_to_talk", "show_stats", "auto_retry"].map(toggle),
+            },
+            { name: "aspect_ratio", selector: { text: {} } },
+          ],
+        },
+      ],
+      computeLabel: (schema) => editorLabel(schema.name),
+    };
+  }
 
   static getStubConfig(hass) {
     const entities = (hass && hass.entities) || {};

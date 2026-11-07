@@ -97,7 +97,8 @@ relevant.
 
 The integration serves the card and loads it on every dashboard: there is nothing
 to copy and no resource to add, and each update reaches the browsers at once. Add
-the card to a view (a dedicated "Intercom" view works best):
+the card to a view (a dedicated "Intercom" view works best); the visual editor covers
+every option, or use YAML:
 
 ```yaml
 type: custom:ajax-doorbell-card

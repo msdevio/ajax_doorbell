@@ -108,7 +108,8 @@ le cas.
 
 L'intégration fournit la carte et la charge sur tous les tableaux de bord : rien à
 copier, aucune ressource à ajouter, et chaque mise à jour arrive aussitôt dans les
-navigateurs. Ajoute la carte à une vue (une vue « Interphone » dédiée est idéale) :
+navigateurs. Ajoute la carte à une vue (une vue « Interphone » dédiée est idéale) ;
+l'éditeur visuel couvre toutes les options, ou passe par le YAML :
 
 ```yaml
 type: custom:ajax-doorbell-card
