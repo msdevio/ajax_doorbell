@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import device_registry as dr, issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
 from homeassistant.helpers.event import async_call_later
@@ -22,7 +24,6 @@ from .call import CallManager
 from .const import (
     CONF_CALL_TIMEOUT,
     CONF_RING_DURATION,
-    CONF_RTSP_PORT,
     DEFAULT_CALL_TIMEOUT,
     DEFAULT_RING_DURATION,
     DEFAULT_RTSP_PORT,
@@ -36,7 +37,15 @@ from .const import (
     TOPIC_RING,
 )
 from .events import EventStream
-from .onvif import AjaxOnvifClient, DeviceIdentity, MediaProfile, OnvifError, OnvifEvent
+from .onvif import (
+    AjaxOnvifClient,
+    DeviceIdentity,
+    MediaProfile,
+    OnvifAuthError,
+    OnvifError,
+    OnvifEvent,
+    host_port,
+)
 from .rtsp import RtspError, SdpMedia, StreamDescription, async_describe
 
 if TYPE_CHECKING:
@@ -46,6 +55,10 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 DETECTIONS = ("motion", "person", "vehicle", "pet")
+# Motion is a true/false property the device clears itself; AI detections are
+# not always cleared, so they turn off after DETECTION_HOLD seconds.
+HELD_DETECTIONS = frozenset({"person", "vehicle", "pet"})
+_PREFIX = re.compile(r"(^|/)[\w.-]+:")
 _OBJECT_CLASSES = {
     "human": "person",
     "person": "person",
@@ -62,8 +75,14 @@ _OBJECT_CLASSES = {
 }
 
 
+def normalize_topic(topic: str) -> str:
+    """Drop the namespace prefix of every segment: tnsajax:X/tns1:Y -> X/Y."""
+    return _PREFIX.sub(r"\1", topic.strip())
+
+
 def _matches(topic: str, patterns: tuple[str, ...]) -> bool:
-    return any(pattern in topic for pattern in patterns)
+    plain = normalize_topic(topic)
+    return any(pattern in plain for pattern in patterns)
 
 
 def _is_true(value: str | None) -> bool:
@@ -95,10 +114,10 @@ class Detections:
 
     @callback
     def set(self, key: str, value: bool) -> None:
-        """Record a detection; an 'on' that never clears turns off by itself."""
+        """Record a detection; an AI 'on' that never clears turns off by itself."""
         if (cancel := self._timers.pop(key, None)) is not None:
             cancel()
-        if value:
+        if value and key in HELD_DETECTIONS:
 
             @callback
             def _hold_expired(_now: datetime) -> None:
@@ -154,10 +173,17 @@ class AjaxDoorbell:
         )
         self.detections = Detections(hass)
         self.events = EventStream(
-            hass, self.client, self._on_event, self._on_connection, self._on_auth_error
+            hass,
+            self.client,
+            self._on_event,
+            self._on_connection,
+            self._async_events_refused,
+            self._events_recovered,
         )
         self._ring_listeners: list[Callable[[], None]] = []
         self._connection_listeners: list[Callable[[], None]] = []
+        self._capability_listeners: list[Callable[[], None]] = []
+        self._reprobe: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ setup
 
@@ -221,6 +247,8 @@ class AjaxDoorbell:
 
     async def async_shutdown(self) -> None:
         """Stop everything."""
+        if self._reprobe is not None:
+            self._reprobe.cancel()
         await self.events.async_stop()
         self.call.shutdown()
         self.detections.shutdown()
@@ -267,10 +295,12 @@ class AjaxDoorbell:
         return info
 
     def stream_url(self, profile: MediaProfile, *, with_credentials: bool = True) -> str:
-        """Return the RTSP URL of a profile, aimed at the configured host."""
+        """Return the RTSP URL of a profile, aimed at the configured host.
+
+        The port is the one the device announces in GetStreamUri.
+        """
         parts = urlsplit(self.stream_uris[profile.token])
-        port = parts.port or self.entry.data.get(CONF_RTSP_PORT, DEFAULT_RTSP_PORT)
-        netloc = f"{self.client.host}:{port}"
+        netloc = host_port(self.client.host, parts.port or DEFAULT_RTSP_PORT)
         if with_credentials:
             data = self.entry.data
             user = quote(data[CONF_USERNAME], safe="")
@@ -291,7 +321,10 @@ class AjaxDoorbell:
                 _LOGGER.debug("Snapshot URI failed (%s), using the stream", err)
         provider = camera.webrtc_provider
         if provider is not None and hasattr(provider, "async_get_image"):
-            return await provider.async_get_image(camera, width, height)
+            try:
+                return await provider.async_get_image(camera, width, height)
+            except Exception as err:
+                _LOGGER.debug("go2rtc could not grab a frame: %s", err)
         return None
 
     # ----------------------------------------------------------------- events
@@ -318,13 +351,57 @@ class AjaxDoorbell:
         return lambda: self._connection_listeners.remove(listener)
 
     @callback
-    def _on_connection(self, _connected: bool) -> None:
-        for listener in list(self._connection_listeners):
-            listener()
+    def async_add_capability_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        """Call listener when the talk-back capability is learnt later."""
+        self._capability_listeners.append(listener)
+        return lambda: self._capability_listeners.remove(listener)
 
     @callback
-    def _on_auth_error(self) -> None:
-        self.entry.async_start_reauth(self.hass)
+    def _on_connection(self, connected: bool) -> None:
+        for listener in list(self._connection_listeners):
+            listener()
+        if connected and self.description is None and self._reprobe is None:
+            # The stream probe failed at setup (doorbell busy or rebooting):
+            # now that the device answers again, learn its tracks.
+            self._reprobe = self.entry.async_create_background_task(
+                self.hass, self._async_reprobe(), "ajax_doorbell backchannel probe"
+            )
+
+    async def _async_reprobe(self) -> None:
+        try:
+            await self.async_probe_backchannel()
+        finally:
+            self._reprobe = None
+        if self.description is not None:
+            for listener in list(self._capability_listeners):
+                listener()
+
+    @property
+    def _issue_id(self) -> str:
+        return f"event_permission_{self.entry.entry_id}"
+
+    async def _async_events_refused(self) -> None:
+        """Events keep being refused: wrong password, or a role without events?"""
+        try:
+            await self.client.async_get_profiles()
+        except OnvifAuthError:
+            self.entry.async_start_reauth(self.hass)
+            return
+        except OnvifError:
+            return  # unreachable: the stream keeps retrying
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self._issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="event_permission",
+            translation_placeholders={"name": self.entry.title},
+        )
+
+    @callback
+    def _events_recovered(self) -> None:
+        ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
 
     @callback
     def _on_event(self, event: OnvifEvent) -> None:
@@ -370,12 +447,12 @@ class AjaxDoorbell:
         if now - self._last_ring < RING_DEBOUNCE:
             return
         self._last_ring = now
+        self.call.ring()
+        for listener in list(self._ring_listeners):
+            listener()
         delay = ""
         if event.utc_time is not None:
             late = (dt_util.utcnow() - event.utc_time + self.client.time_offset).total_seconds()
             if 0 <= late < 60:  # only meaningful when both clocks agree
                 delay = f" ({late * 1000:.0f} ms after the press)"
         _LOGGER.info("%s: doorbell pressed%s", self.entry.title, delay)
-        self.call.ring()
-        for listener in list(self._ring_listeners):
-            listener()

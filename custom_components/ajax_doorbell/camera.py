@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import AjaxDoorbellConfigEntry
@@ -60,6 +60,22 @@ class AjaxDoorbellCamera(AjaxDoorbellEntity, Camera):
         else:
             self._attr_translation_key = "substream"
             self._attr_entity_registry_enabled_default = False
+
+    async def async_added_to_hass(self) -> None:
+        """Follow a talk-back capability learnt after setup."""
+        await super().async_added_to_hass()
+        if self._attr_name is None:  # main stream
+            self.async_on_remove(
+                self._doorbell.async_add_capability_listener(self._capabilities_changed)
+            )
+
+    @callback
+    def _capabilities_changed(self) -> None:
+        if CameraEntityCapabilities is not None:
+            self._attr_camera_entity_capabilities = CameraEntityCapabilities(
+                two_way_audio=self._doorbell.two_way_audio
+            )
+        self.async_write_ha_state()
 
     @property
     def extra_state_attributes(self) -> dict[str, str | int | float | None]:

@@ -13,6 +13,8 @@ from custom_components.ajax_doorbell.onvif import (
     OnvifAuthError,
     OnvifConnectionError,
     OnvifError,
+    PullPoint,
+    host_port,
     parse_notifications,
     parse_profiles,
     parse_topics,
@@ -189,3 +191,56 @@ def test_same_host_keeps_the_port() -> None:
         == "http://10.0.0.5:8080/onvif/event_service?sub=1"
     )
     assert client._same_host("http://192.168.1.2/snap.jpg") == "http://10.0.0.5/snap.jpg"
+
+
+def test_naive_times_are_utc() -> None:
+    """A device that leaves out the Z still gives an aware time."""
+    xml = load_xml("pull_messages_ring.xml")
+    for message in xml.iter():
+        if message.get("UtcTime"):
+            message.set("UtcTime", message.get("UtcTime").rstrip("Z"))
+    ring = parse_notifications(xml)[0]
+    assert ring.utc_time == datetime(2026, 11, 7, 10, 0, 0, 250000, tzinfo=UTC)
+
+
+async def test_never_follows_redirects() -> None:
+    """Requests skip the session middlewares, so they must not follow redirects."""
+    session = FakeSession([(200, DEVICE_INFO)])
+    await AjaxOnvifClient(session, HOST, 8080, "u", "p").async_get_identity()
+    assert session.calls[0]["allow_redirects"] is False
+
+
+async def test_colon_in_username_is_an_auth_error() -> None:
+    """HTTP Digest cannot carry a ':' in the username."""
+    client = AjaxOnvifClient(FakeSession([(401, b"")]), HOST, 8080, "a:b", "p")
+    with pytest.raises(OnvifAuthError):
+        await client.async_get_identity()
+
+
+async def test_reference_parameters_are_echoed() -> None:
+    """Subscription calls carry the reference parameters the device gave."""
+    created = (
+        b'<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://'
+        b'www.w3.org/2005/08/addressing" xmlns:tev="http://www.onvif.org/ver10/events/wsdl">'
+        b"<s:Body><tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference>"
+        b"<wsa:Address>http://192.168.1.9:8080/onvif/event_service?sub=7</wsa:Address>"
+        b'<wsa:ReferenceParameters><dn:SubId xmlns:dn="urn:x">7</dn:SubId>'
+        b"</wsa:ReferenceParameters></tev:SubscriptionReference>"
+        b"</tev:CreatePullPointSubscriptionResponse></s:Body></s:Envelope>"
+    )
+    empty = b'<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body/></s:Envelope>'
+    session = FakeSession([(200, created), (200, empty)])
+    client = AjaxOnvifClient(session, HOST, 8080, "u", "p")
+    pullpoint = await client.async_create_pullpoint(600)
+    assert pullpoint.address == f"http://{HOST}:8080/onvif/event_service?sub=7"
+    assert "SubId" in pullpoint.reference_parameters
+    assert await client.async_pull(pullpoint, 1) == []
+    assert b"SubId" in session.calls[1]["data"]
+    assert isinstance(pullpoint, PullPoint)
+
+
+def test_host_port_brackets_ipv6() -> None:
+    """IPv6 literals get brackets in URLs."""
+    assert host_port("fe80::1", 8554) == "[fe80::1]:8554"
+    assert host_port("192.168.1.2", 8554) == "192.168.1.2:8554"
+    assert host_port("doorbell.lan", None) == "doorbell.lan"

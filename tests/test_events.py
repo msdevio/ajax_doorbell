@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.ajax_doorbell import events
 from custom_components.ajax_doorbell.const import DOMAIN
 from custom_components.ajax_doorbell.events import EventStream
 from custom_components.ajax_doorbell.onvif import (
     OnvifAuthError,
+    OnvifConnectionError,
     PullPoint,
     parse_notifications,
 )
@@ -30,14 +33,52 @@ def _client() -> MagicMock:
     return client
 
 
-async def test_dispatches_and_releases(hass: HomeAssistant) -> None:
-    """Events are handed over; stopping releases the subscription."""
+class Recorder:
+    """Collects what the stream reports."""
+
+    def __init__(self) -> None:
+        self.events: list = []
+        self.connection: list[bool] = []
+        self.refused = AsyncMock()
+        self.recovered: list[int] = []
+
+    def stream(self, hass: HomeAssistant, client: MagicMock) -> EventStream:
+        return EventStream(
+            hass,
+            client,
+            self.events.append,
+            self.connection.append,
+            self.refused,
+            lambda: self.recovered.append(1),
+        )
+
+
+@pytest.fixture
+def entry(hass: HomeAssistant) -> MockConfigEntry:
+    """A config entry to own the background task."""
     entry = MockConfigEntry(domain=DOMAIN)
     entry.add_to_hass(hass)
-    events = parse_notifications(load_xml("pull_messages_ring.xml"))
+    return entry
+
+
+@pytest.fixture
+def fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No waiting between attempts."""
+    monkeypatch.setattr(events, "RESYNC_DELAY", 0)
+    monkeypatch.setattr(events, "REFUSED_DELAY", 0)
+
+
+async def _spin(rounds: int = 20) -> None:
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+async def test_dispatches_and_releases(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """Events are handed over; stopping releases the subscription."""
+    batch = parse_notifications(load_xml("pull_messages_ring.xml"))
     client = _client()
     gate = asyncio.Event()
-    batches = [events]
+    batches = [batch]
 
     async def pull(pullpoint: PullPoint, wait: int) -> list:
         if batches:
@@ -46,31 +87,60 @@ async def test_dispatches_and_releases(hass: HomeAssistant) -> None:
         return []
 
     client.async_pull = pull
-    received, connection, auth = [], [], []
-    stream = EventStream(hass, client, received.append, connection.append, lambda: auth.append(1))
+    recorder = Recorder()
+    stream = recorder.stream(hass, client)
     stream.start(entry)
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert received == events
-    assert connection == [True]
-    assert stream.connected
+    await _spin()
+    assert recorder.events == batch
+    assert recorder.connection == [True]
     await stream.async_stop()
     client.async_unsubscribe.assert_awaited_once()
-    assert auth == []
+    assert recorder.connection == [True, False]
+    recorder.refused.assert_not_awaited()
 
 
-async def test_auth_error_after_clock_resync(hass: HomeAssistant) -> None:
-    """A refused account is retried once after reading the clock, then reported."""
-    entry = MockConfigEntry(domain=DOMAIN)
-    entry.add_to_hass(hass)
+async def test_connected_only_after_a_pull(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """A subscription whose pulls fail never reports the stream as up."""
+    client = _client()
+    client.async_pull = AsyncMock(side_effect=OnvifConnectionError("blocked"))
+    recorder = Recorder()
+    stream = recorder.stream(hass, client)
+    stream.start(entry)
+    await _spin()
+    assert recorder.connection == []
+    assert stream.last_error == "blocked"
+    await stream.async_stop()
+
+
+@pytest.mark.usefixtures("fast")
+async def test_refusal_is_reported_once_and_retried(
+    hass: HomeAssistant, entry: MockConfigEntry
+) -> None:
+    """A refusal resyncs the clock, then is reported once while retries go on."""
     client = _client()
     client.async_create_pullpoint.side_effect = OnvifAuthError("no")
-    auth: list[int] = []
-    stream = EventStream(hass, client, lambda e: None, lambda c: None, lambda: auth.append(1))
+    recorder = Recorder()
+    stream = recorder.stream(hass, client)
     stream.start(entry)
-    for _ in range(10):
+    await _spin(60)
+    recorder.refused.assert_awaited_once()
+    client.async_update_time_offset.assert_awaited()
+    assert client.async_create_pullpoint.await_count > 3
+    assert stream.connected is False
+
+    # The device accepts the account again (it had rebooted): events resume.
+    client.async_create_pullpoint.side_effect = None
+    gate = asyncio.Event()
+
+    async def pull(pullpoint: PullPoint, wait: int) -> list:
         await asyncio.sleep(0)
-    assert auth == [1]
-    client.async_update_time_offset.assert_awaited_once()
-    assert client.async_create_pullpoint.await_count == 2
+        if not stream.connected:
+            return []
+        await gate.wait()
+        return []
+
+    client.async_pull = pull
+    await _spin(60)
+    assert stream.connected is True
+    assert recorder.recovered == [1]
     await stream.async_stop()

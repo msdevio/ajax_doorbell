@@ -179,6 +179,6 @@ async def async_describe(
             finally:
                 writer.close()
     except (OSError, TimeoutError, asyncio.IncompleteReadError, ValueError) as err:
-        raise RtspError(f"{parts.hostname}: {err or type(err).__name__}") from err
+        raise RtspError(f"{parts.hostname}: {str(err) or type(err).__name__}") from err
     medias = parse_sdp(body.decode(errors="replace")) if status == 200 else ()
     return StreamDescription(status, medias)

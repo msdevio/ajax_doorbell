@@ -86,6 +86,18 @@ async def test_dismiss(hass: HomeAssistant) -> None:
     assert call.missed_calls == 0
 
 
+async def test_hang_up_while_ringing_declines(hass: HomeAssistant) -> None:
+    """Hanging up a ringing call declines it rather than leaving it to be missed."""
+    events = async_capture_events(hass, EVENT_CALL)
+    call = _manager(hass)
+    call.ring()
+    call.hang_up()
+    await _later(hass, 31)
+    assert call.state is CallState.IDLE
+    assert call.missed_calls == 0
+    assert [e.data["type"] for e in events] == ["ring", "dismissed"]
+
+
 async def test_ring_during_call(hass: HomeAssistant) -> None:
     """A second press during a call is reported but changes nothing."""
     events = async_capture_events(hass, EVENT_CALL)

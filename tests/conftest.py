@@ -23,7 +23,7 @@ if "turbojpeg" not in sys.modules:
         sys.modules["turbojpeg"] = _turbojpeg
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.ajax_doorbell.const import CONF_RTSP_PORT, DOMAIN
+from custom_components.ajax_doorbell.const import DOMAIN
 from custom_components.ajax_doorbell.onvif import (
     DeviceIdentity,
     parse_profiles,
@@ -38,7 +38,6 @@ MAC = "9c:75:6e:12:34:56"
 ENTRY_DATA = {
     CONF_HOST: HOST,
     CONF_PORT: 8080,
-    CONF_RTSP_PORT: 8554,
     CONF_USERNAME: "homeassistant",
     CONF_PASSWORD: "secret",
 }

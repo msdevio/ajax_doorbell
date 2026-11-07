@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_capture_events,
+    async_fire_time_changed,
 )
 
 from custom_components.ajax_doorbell.const import DOMAIN, EVENT_CALL
@@ -20,14 +22,19 @@ from custom_components.ajax_doorbell.onvif import (
     OnvifEvent,
     parse_notifications,
 )
-from custom_components.ajax_doorbell.rtsp import StreamDescription
+from custom_components.ajax_doorbell.rtsp import RtspError, StreamDescription
 from homeassistant.components.camera.helper import get_camera_from_entity_id
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import (
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.util import dt as dt_util
 
-from .conftest import MAC, load_xml
+from .conftest import DESCRIPTION, MAC, load_xml
 
 pytestmark = pytest.mark.usefixtures("mock_client", "no_event_stream")
 
@@ -197,9 +204,105 @@ async def test_unload_and_diagnostics(hass: HomeAssistant, mock_entry: MockConfi
     assert diagnostics["entry"]["data"]["password"] == "**REDACTED**"
     assert diagnostics["device"]["serial"] == "**REDACTED**"
     assert diagnostics["stream_uris"]["main_token"] == (
-        "rtsp://192.168.128.31:8554/9c756e123456-0_m"
+        "rtsp://192.168.128.31:8554/**REDACTED**-0_m"
     )
+    assert "9c756e123456" not in str(diagnostics)
     assert diagnostics["two_way_audio"] is True
     assert "secret" not in str(diagnostics)
     assert await hass.config_entries.async_unload(mock_entry.entry_id)
     assert mock_entry.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_talk_back_learnt_after_setup(
+    hass: HomeAssistant, mock_entry: MockConfigEntry
+) -> None:
+    """A stream probe that failed at setup is retried once events flow."""
+    with patch(
+        "custom_components.ajax_doorbell.doorbell.async_describe",
+        AsyncMock(side_effect=[RtspError("busy"), DESCRIPTION]),
+    ):
+        await _setup(hass, mock_entry)
+        await hass.async_block_till_done(wait_background_tasks=True)
+    assert mock_entry.runtime_data.two_way_audio is True
+    if HAS_TWO_WAY_AUDIO:
+        camera = get_camera_from_entity_id(hass, _entity(hass, "camera", "camera"))
+        assert camera.camera_entity_capabilities.two_way_audio is True
+
+
+@pytest.mark.usefixtures("mock_describe")
+async def test_events_refused(
+    hass: HomeAssistant, mock_client: MagicMock, mock_entry: MockConfigEntry
+) -> None:
+    """A role without events raises a repair; a wrong password asks for reauth."""
+    await _setup(hass, mock_entry)
+    doorbell = mock_entry.runtime_data
+    issue_id = f"event_permission_{mock_entry.entry_id}"
+
+    await doorbell._async_events_refused()
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+    doorbell._events_recovered()
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+
+    mock_client.async_get_profiles.side_effect = OnvifAuthError("no")
+    await doorbell._async_events_refused()
+    await hass.async_block_till_done()
+    flows = hass.config_entries.flow.async_progress()
+    assert [flow["context"]["source"] for flow in flows] == ["reauth"]
+
+
+@pytest.mark.usefixtures("mock_describe")
+async def test_motion_follows_the_device(hass: HomeAssistant, mock_entry: MockConfigEntry) -> None:
+    """Motion stays on while the device says so; AI detections time out."""
+    await _setup(hass, mock_entry)
+    doorbell = mock_entry.runtime_data
+    doorbell._on_event(
+        OnvifEvent(
+            "tns1:RuleEngine/tnsajax:MotionDetector/Detection",
+            "Changed",
+            None,
+            {},
+            {"State": "true"},
+        )
+    )
+    doorbell._on_event(
+        OnvifEvent(
+            "tns1:RuleEngine/tnsajax:ObjectDetector/Detection",
+            "Changed",
+            None,
+            {},
+            {"ClassTypes": "Human"},
+        )
+    )
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+    await hass.async_block_till_done()
+    assert hass.states.get(_entity(hass, "binary_sensor", "motion")).state == "on"
+    assert hass.states.get(_entity(hass, "binary_sensor", "person")).state == "off"
+    doorbell._on_event(
+        OnvifEvent(
+            "tns1:RuleEngine/tnsajax:MotionDetector/Detection",
+            "Changed",
+            None,
+            {},
+            {"State": "false"},
+        )
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get(_entity(hass, "binary_sensor", "motion")).state == "off"
+
+
+@pytest.mark.usefixtures("mock_describe")
+async def test_prefixed_ring_topic(hass: HomeAssistant, mock_entry: MockConfigEntry) -> None:
+    """Namespace prefixes on any segment do not hide a ring."""
+    await _setup(hass, mock_entry)
+    mock_entry.runtime_data._on_event(
+        OnvifEvent(
+            "tns1:RuleEngine/tnsajax:RingDetector/tnsajax:Detection",
+            "Changed",
+            None,
+            {},
+            {"Detected": "true"},
+        )
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get(_entity(hass, "sensor", "call_state")).state == "ringing"
+    mock_entry.runtime_data.call.shutdown()

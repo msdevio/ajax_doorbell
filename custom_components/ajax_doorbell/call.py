@@ -114,7 +114,10 @@ class CallManager:
 
     @callback
     def hang_up(self) -> None:
-        """End the conversation."""
+        """End the conversation; while it rings, decline it."""
+        if self.state is CallState.RINGING:
+            self.dismiss()
+            return
         if self.state is not CallState.IN_CALL:
             return
         self._cancel("_call_timer")

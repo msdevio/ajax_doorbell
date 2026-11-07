@@ -10,3 +10,4 @@ secrets/
 *.env
 *.token
 tools/phase0/reports/
+zip/

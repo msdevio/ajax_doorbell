@@ -9,14 +9,12 @@
           "host": "Hôte",
           "username": "Utilisateur ONVIF",
           "password": "Mot de passe ONVIF",
-          "port": "Port ONVIF",
-          "rtsp_port": "Port RTSP"
+          "port": "Port ONVIF"
         },
         "data_description": {
           "host": "Adresse IP de la DoorBell sur ton réseau. Réserve-lui une adresse fixe dans ton routeur.",
           "username": "Pas ton compte Ajax : l'utilisateur ONVIF local de la DoorBell.",
-          "port": "8080, sauf si tu l'as changé dans l'app Ajax.",
-          "rtsp_port": "8554, sauf si tu l'as changé dans l'app Ajax."
+          "port": "8080, sauf si tu l'as changé dans l'app Ajax. Le port RTSP est lu sur la DoorBell."
         }
       },
       "reauth_confirm": {
@@ -31,8 +29,7 @@
         "title": "Changer l'adresse de la DoorBell",
         "data": {
           "host": "Hôte",
-          "port": "Port ONVIF",
-          "rtsp_port": "Port RTSP"
+          "port": "Port ONVIF"
         }
       }
     },
@@ -66,21 +63,39 @@
   },
   "entity": {
     "binary_sensor": {
-      "ringing": { "name": "Appel entrant" },
-      "motion": { "name": "Mouvement" },
-      "person": { "name": "Personne" },
-      "vehicle": { "name": "Véhicule" },
-      "pet": { "name": "Animal" },
-      "event_stream": { "name": "Flux d'événements" }
+      "ringing": {
+        "name": "Appel entrant"
+      },
+      "motion": {
+        "name": "Mouvement"
+      },
+      "person": {
+        "name": "Personne"
+      },
+      "vehicle": {
+        "name": "Véhicule"
+      },
+      "pet": {
+        "name": "Animal"
+      },
+      "event_stream": {
+        "name": "Flux d'événements"
+      }
     },
     "camera": {
-      "substream": { "name": "Flux secondaire" }
+      "substream": {
+        "name": "Flux secondaire"
+      }
     },
     "event": {
       "ring": {
         "name": "Sonnette",
         "state_attributes": {
-          "event_type": { "state": { "ring": "Sonnerie" } }
+          "event_type": {
+            "state": {
+              "ring": "Sonnerie"
+            }
+          }
         }
       }
     },
@@ -93,14 +108,24 @@
           "in_call": "En cours"
         }
       },
-      "last_ring": { "name": "Dernière sonnerie" },
-      "missed_calls": { "name": "Appels manqués" }
+      "last_ring": {
+        "name": "Dernière sonnerie"
+      },
+      "missed_calls": {
+        "name": "Appels manqués"
+      }
     }
   },
   "exceptions": {
-    "invalid_auth": { "message": "La DoorBell a refusé le compte ONVIF." },
-    "cannot_connect": { "message": "DoorBell injoignable : {error}" },
-    "no_doorbell": { "message": "Aucune Ajax DoorBell chargée ne correspond à cette cible." }
+    "invalid_auth": {
+      "message": "La DoorBell a refusé le compte ONVIF."
+    },
+    "cannot_connect": {
+      "message": "DoorBell injoignable : {error}"
+    },
+    "no_doorbell": {
+      "message": "Aucune Ajax DoorBell chargée ne correspond à cette cible."
+    }
   },
   "services": {
     "answer": {
@@ -124,6 +149,12 @@
     "clear_missed": {
       "name": "Effacer les appels manqués",
       "description": "Remet à zéro le compteur d'appels manqués."
+    }
+  },
+  "issues": {
+    "event_permission": {
+      "title": "{name} : pas d'accès aux événements de la sonnette",
+      "description": "La DoorBell montre sa vidéo au compte ONVIF mais refuse son abonnement aux événements : les sonneries et les détections n'arrivent pas dans Home Assistant. Dans l'app Ajax, donne le rôle Opérateur à cet utilisateur ONVIF (Appareils → DoorBell → Paramètres → Service → Connexion via ONVIF → Utilisateurs ONVIF). Ce message disparaît tout seul dès que les événements reviennent."
     }
   }
 }

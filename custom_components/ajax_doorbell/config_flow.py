@@ -14,7 +14,7 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
-    OptionsFlow,
+    OptionsFlowWithReload,
 )
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
@@ -33,15 +33,14 @@ from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 from .const import (
     CONF_CALL_TIMEOUT,
     CONF_RING_DURATION,
-    CONF_RTSP_PORT,
     DEFAULT_CALL_TIMEOUT,
     DEFAULT_ONVIF_PORT,
     DEFAULT_RING_DURATION,
-    DEFAULT_RTSP_PORT,
     DEFAULT_USERNAME,
     DOMAIN,
     TOPIC_RING,
 )
+from .doorbell import normalize_topic
 from .onvif import AjaxOnvifClient, DeviceIdentity, OnvifAuthError, OnvifError
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,21 +65,29 @@ class ProbeResult:
 async def async_probe(
     hass: HomeAssistant, host: str, port: int, username: str, password: str
 ) -> ProbeResult:
-    """Log in, read the identity and prove the account can see the video."""
+    """Log in and make the calls the setup needs, so a flow that passes sets up."""
     client = AjaxOnvifClient(async_get_clientsession(hass), host, port, username, password)
     await client.async_update_time_offset()
-    with suppress(OnvifError):
+    try:
         await client.async_get_services()
+    except OnvifAuthError:
+        raise
+    except OnvifError as err:
+        _LOGGER.debug("GetServices failed (%s), using default paths", err)
     identity = await client.async_get_identity()
-    if not await client.async_get_profiles():
+    profiles = await client.async_get_profiles()
+    if not profiles:
         raise NoProfilesError
+    await client.async_get_stream_uri(max(profiles, key=lambda p: p.pixels).token)
     mac = None
     with suppress(OnvifError):
         mac = await client.async_get_mac()
     topics: list[str] = []
     with suppress(OnvifError):
         topics = await client.async_get_topics()
-    doorbell = not topics or any(p in t for t in topics for p in TOPIC_RING)
+    doorbell = not topics or any(
+        pattern in normalize_topic(topic) for topic in topics for pattern in TOPIC_RING
+    )
     return ProbeResult(identity, mac, doorbell)
 
 
@@ -91,7 +98,6 @@ def _user_schema(host: str | None) -> vol.Schema:
             vol.Required(CONF_USERNAME, default=DEFAULT_USERNAME): str,
             vol.Required(CONF_PASSWORD): PASSWORD,
             vol.Required(CONF_PORT, default=DEFAULT_ONVIF_PORT): PORT,
-            vol.Required(CONF_RTSP_PORT, default=DEFAULT_RTSP_PORT): PORT,
         }
     )
 
@@ -108,7 +114,7 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+    def async_get_options_flow(config_entry: ConfigEntry) -> AjaxDoorbellOptionsFlow:
         """Return the options flow."""
         return AjaxDoorbellOptionsFlow()
 
@@ -167,7 +173,6 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
                     updates={
                         CONF_HOST: user_input[CONF_HOST],
                         CONF_PORT: user_input[CONF_PORT],
-                        CONF_RTSP_PORT: user_input[CONF_RTSP_PORT],
                     }
                 )
                 title = "Ajax DoorBell" if result.doorbell else f"Ajax {result.identity.model}"
@@ -210,7 +215,7 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Change the address or ports of the same DoorBell."""
+        """Change the address or port of the same DoorBell."""
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -224,21 +229,15 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="reconfigure",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(
-                    {
-                        vol.Required(CONF_HOST): str,
-                        vol.Required(CONF_PORT): PORT,
-                        vol.Required(CONF_RTSP_PORT): PORT,
-                    }
-                ),
+                vol.Schema({vol.Required(CONF_HOST): str, vol.Required(CONF_PORT): PORT}),
                 user_input or entry.data,
             ),
             errors=errors,
         )
 
 
-class AjaxDoorbellOptionsFlow(OptionsFlow):
-    """Ring and call timings."""
+class AjaxDoorbellOptionsFlow(OptionsFlowWithReload):
+    """Ring and call timings; saving them reloads the DoorBell."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Show the options."""

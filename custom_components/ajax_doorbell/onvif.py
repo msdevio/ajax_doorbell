@@ -121,6 +121,16 @@ class PullPoint:
     """An active PullPoint subscription."""
 
     address: str
+    # WS-Addressing reference parameters the device wants echoed in every
+    # request to the subscription, as serialized header blocks.
+    reference_parameters: str = ""
+
+
+def host_port(host: str, port: int | None) -> str:
+    """Return host:port for a URL, with IPv6 literals in brackets."""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{host}:{port}" if port else host
 
 
 def local_name(tag: str) -> str:
@@ -265,6 +275,8 @@ def parse_notifications(root: ET.Element) -> list[OnvifEvent]:
                 utc_time = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
             except ValueError:
                 utc_time = None
+            if utc_time is not None and utc_time.tzinfo is None:
+                utc_time = utc_time.replace(tzinfo=UTC)  # ONVIF times are UTC
         events.append(
             OnvifEvent(
                 topic=topic,
@@ -297,13 +309,22 @@ class AjaxOnvifClient:
         self._offset = timedelta(0)
         self._http_digest = False
         self._digest_middleware: aiohttp.DigestAuthMiddleware | None = None
+        # aiohttp binds a Digest middleware to the origin it first talks to,
+        # so snapshots (often on another port) get their own, per origin.
+        self._snapshot_middlewares: dict[str, aiohttp.DigestAuthMiddleware] = {}
         self.services: dict[str, str] = {}
+
+    def _new_digest(self) -> aiohttp.DigestAuthMiddleware:
+        try:
+            return aiohttp.DigestAuthMiddleware(self._username, self._password)
+        except ValueError as err:  # e.g. a ':' in the username
+            raise OnvifAuthError(f"{self.host}: {err}") from err
 
     @property
     def _digest(self) -> aiohttp.DigestAuthMiddleware:
-        """Return the HTTP Digest middleware, built on first use."""
+        """Return the HTTP Digest middleware for the ONVIF port, built on first use."""
         if self._digest_middleware is None:
-            self._digest_middleware = aiohttp.DigestAuthMiddleware(self._username, self._password)
+            self._digest_middleware = self._new_digest()
         return self._digest_middleware
 
     @property
@@ -317,22 +338,22 @@ class AjaxOnvifClient:
         return self._http_digest
 
     def _same_host(self, url: str) -> str:
-        """Point a device-provided address at the host and port we were given.
+        """Point a device-provided address at the host we were given.
 
-        Devices report their own idea of their address; after a DHCP change, or
-        behind NAT, that is not the one Home Assistant reaches them on.
+        Devices report their own idea of their address; after a DHCP change
+        that is not the one Home Assistant reaches them on. The port the device
+        gives is kept.
         """
         parts = urlsplit(url)
         if not parts.scheme.startswith("http") or not parts.hostname:
             return url
-        netloc = f"{self.host}:{parts.port}" if parts.port else self.host
-        return urlunsplit(parts._replace(netloc=netloc))
+        return urlunsplit(parts._replace(netloc=host_port(self.host, parts.port)))
 
     def service_url(self, name: str) -> str:
         """Return the endpoint of a service."""
         if name in self.services:
             return self.services[name]
-        return f"http://{self.host}:{self.port}/onvif/{DEFAULT_PATHS[name]}"
+        return f"http://{host_port(self.host, self.port)}/onvif/{DEFAULT_PATHS[name]}"
 
     def _security_header(self) -> str:
         created = (datetime.now(UTC) + self._offset).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -362,10 +383,12 @@ class AjaxOnvifClient:
         auth: bool = True,
         action: str | None = None,
         timeout: float = 10,
+        extra_header: str = "",
     ) -> ET.Element:
         header = self._security_header() if auth else ""
         if action:
             header += f"<wsa:Action>{action}</wsa:Action><wsa:To>{escape(url)}</wsa:To>"
+        header += extra_header
         envelope = (
             f'<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="{NS_SOAP}" '
             f'xmlns:wsa="{NS_WSA}" xmlns:tt="{NS_TT}">'
@@ -381,17 +404,27 @@ class AjaxOnvifClient:
                 data=envelope.encode(),
                 headers={"Content-Type": content_type},
                 timeout=aiohttp.ClientTimeout(total=timeout),
+                # Per-request middlewares replace the session's, including Home
+                # Assistant's redirect guard: never follow a redirect instead.
                 middlewares=(self._digest,) if auth and self._http_digest else (),
+                allow_redirects=False,
             ) as resp:
                 status, raw = resp.status, await resp.read()
         except (aiohttp.ClientError, TimeoutError) as err:
-            raise OnvifConnectionError(f"{self.host}: {err or type(err).__name__}") from err
+            raise OnvifConnectionError(f"{self.host}: {str(err) or type(err).__name__}") from err
         refused = status == 401 or (status in (400, 500) and b"NotAuthorized" in raw)
         if refused:
             if auth and not self._http_digest:
                 _LOGGER.debug("%s asks for HTTP Digest, switching", self.host)
                 self._http_digest = True
-                return await self._call(url, body, auth=auth, action=action, timeout=timeout)
+                return await self._call(
+                    url,
+                    body,
+                    auth=auth,
+                    action=action,
+                    timeout=timeout,
+                    extra_header=extra_header,
+                )
             raise OnvifAuthError(f"{self.host}: credentials refused")
         if status >= 400:
             raise OnvifError(f"{self.host}: HTTP {status} {parse_fault(raw)}")
@@ -501,9 +534,7 @@ class AjaxOnvifClient:
                 f'<GetSnapshotUri xmlns="{NS_MEDIA2}">'
                 f"<ProfileToken>{escape(token)}</ProfileToken></GetSnapshotUri>",
             )
-        except OnvifAuthError:
-            raise
-        except OnvifError:
+        except OnvifError:  # optional: a refusal here must not block the setup
             return None
         return find_text(root, "Uri") or None
 
@@ -521,10 +552,17 @@ class AjaxOnvifClient:
             f'<CreatePullPointSubscription xmlns="{NS_EVENTS}"><InitialTerminationTime>'
             f"PT{seconds}S</InitialTerminationTime></CreatePullPointSubscription>",
         )
-        address = find_text(find(root, "SubscriptionReference"), "Address")
+        reference = find(root, "SubscriptionReference")
+        address = find_text(reference, "Address")
         if not address:
             raise OnvifError(f"{self.host}: subscription without an address")
-        return PullPoint(self._same_host(address))
+        parameters = find(reference, "ReferenceParameters")
+        return PullPoint(
+            self._same_host(address),
+            "".join(ET.tostring(child, encoding="unicode") for child in parameters)
+            if parameters is not None
+            else "",
+        )
 
     async def async_set_synchronization_point(self, pullpoint: PullPoint) -> None:
         """Ask the device to resend the current value of every property."""
@@ -532,6 +570,7 @@ class AjaxOnvifClient:
             pullpoint.address,
             f'<SetSynchronizationPoint xmlns="{NS_EVENTS}"/>',
             action=ACTION_SYNC,
+            extra_header=pullpoint.reference_parameters,
         )
 
     async def async_pull(
@@ -543,6 +582,7 @@ class AjaxOnvifClient:
             f'<PullMessages xmlns="{NS_EVENTS}"><Timeout>PT{wait}S</Timeout>'
             f"<MessageLimit>{limit}</MessageLimit></PullMessages>",
             action=ACTION_PULL,
+            extra_header=pullpoint.reference_parameters,
             timeout=wait + 10,
         )
         return parse_notifications(root)
@@ -553,6 +593,7 @@ class AjaxOnvifClient:
             pullpoint.address,
             f'<Renew xmlns="{NS_WSNT}"><TerminationTime>PT{seconds}S</TerminationTime></Renew>',
             action=ACTION_RENEW,
+            extra_header=pullpoint.reference_parameters,
         )
 
     async def async_unsubscribe(self, pullpoint: PullPoint) -> None:
@@ -561,16 +602,27 @@ class AjaxOnvifClient:
             pullpoint.address,
             f'<Unsubscribe xmlns="{NS_WSNT}"/>',
             action=ACTION_UNSUBSCRIBE,
+            extra_header=pullpoint.reference_parameters,
             timeout=5,
         )
 
     async def async_get_bytes(self, url: str) -> bytes:
-        """Fetch a URL from the device (snapshots) with HTTP Digest."""
+        """Fetch a URL from the device (snapshots) with HTTP Digest.
+
+        Short timeout: Home Assistant gives a still image 10 s in total, and the
+        go2rtc fallback needs some of it.
+        """
+        target = self._same_host(url)
+        parts = urlsplit(target)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        if (middleware := self._snapshot_middlewares.get(origin)) is None:
+            middleware = self._snapshot_middlewares[origin] = self._new_digest()
         try:
             async with self._session.get(
-                self._same_host(url),
-                timeout=aiohttp.ClientTimeout(total=10),
-                middlewares=(self._digest,),
+                target,
+                timeout=aiohttp.ClientTimeout(total=4),
+                middlewares=(middleware,),
+                allow_redirects=False,
             ) as resp:
                 if resp.status == 401:
                     raise OnvifAuthError(f"{self.host}: snapshot refused")
@@ -578,4 +630,4 @@ class AjaxOnvifClient:
                     raise OnvifError(f"{self.host}: snapshot HTTP {resp.status}")
                 return await resp.read()
         except (aiohttp.ClientError, TimeoutError) as err:
-            raise OnvifConnectionError(f"{self.host}: {err or type(err).__name__}") from err
+            raise OnvifConnectionError(f"{self.host}: {str(err) or type(err).__name__}") from err

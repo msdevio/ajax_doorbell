@@ -7,7 +7,6 @@ from typing import Final
 DOMAIN: Final = "ajax_doorbell"
 MANUFACTURER: Final = "Ajax Systems"
 
-CONF_RTSP_PORT: Final = "rtsp_port"
 CONF_RING_DURATION: Final = "ring_duration"
 CONF_CALL_TIMEOUT: Final = "call_timeout"
 

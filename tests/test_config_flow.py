@@ -11,7 +11,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.ajax_doorbell.const import (
     CONF_CALL_TIMEOUT,
     CONF_RING_DURATION,
-    CONF_RTSP_PORT,
     DOMAIN,
 )
 from custom_components.ajax_doorbell.onvif import (
@@ -137,7 +136,7 @@ async def test_reconfigure(
 ) -> None:
     """The address changes only when it is the same DoorBell."""
     mock_entry.add_to_hass(hass)
-    new = {CONF_HOST: "192.168.128.40", CONF_PORT: 8080, CONF_RTSP_PORT: 8554}
+    new = {CONF_HOST: "192.168.128.40", CONF_PORT: 8080}
     mock_client.async_get_mac.return_value = "9c:75:6e:00:00:01"
     result = await mock_entry.start_reconfigure_flow(hass)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], new)

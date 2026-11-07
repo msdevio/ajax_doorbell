@@ -1,0 +1,280 @@
+blueprint:
+  name: Ajax DoorBell — sonnerie, décrocher, appel manqué
+  description: >
+    Quand quelqu'un sonne, envoie aux téléphones choisis une notification avec
+    l'image de la porte et les boutons Décrocher, Voir et Ignorer (et Ouvrir
+    la porte si tu choisis une serrure). Décrocher ouvre le dashboard de
+    l'interphone, dont la carte Ajax DoorBell prend l'appel aussitôt.
+    La notification disparaît sur tous les téléphones dès que quelqu'un
+    répond, ignore l'appel ou le laisse sonner ; un appel manqué peut laisser
+    une notification à la place.
+  domain: automation
+  source_url: https://github.com/msdevio/ajax_doorbell/blob/main/blueprints/automation/ajax_doorbell/doorbell_notify.yaml
+  input:
+    doorbell:
+      name: DoorBell
+      icon: mdi:doorbell-video
+      input:
+        ring_event:
+          name: Sonnette
+          description: L'entité événement « Sonnette » de la DoorBell.
+          selector:
+            entity:
+              filter:
+                integration: ajax_doorbell
+                domain: event
+        call_sensor:
+          name: Appel
+          description: Le capteur « Appel » de la DoorBell.
+          selector:
+            entity:
+              filter:
+                integration: ajax_doorbell
+                domain: sensor
+        camera:
+          name: Caméra
+          description: La caméra principale de la DoorBell (image de la notification).
+          selector:
+            entity:
+              filter:
+                integration: ajax_doorbell
+                domain: camera
+    phones:
+      name: Téléphones
+      icon: mdi:cellphone-message
+      input:
+        notify_devices:
+          name: Téléphones à prévenir
+          description: Appareils avec l'app compagnon Home Assistant.
+          selector:
+            device:
+              filter:
+                integration: mobile_app
+              multiple: true
+        dashboard:
+          name: Vue de l'interphone
+          description: >
+            Chemin de la vue qui contient la carte Ajax DoorBell, par exemple
+            /dashboard-interphone/porte. Décrocher y ajoute ?ajax_answer=…
+          default: /lovelace/0
+          selector:
+            text:
+        title:
+          name: Titre
+          default: On sonne à la porte
+          selector:
+            text:
+        message:
+          name: Message
+          default: Quelqu'un est devant la porte.
+          selector:
+            text:
+        critical:
+          name: Alerte critique sur iPhone
+          description: Sonne même en mode silencieux (autorisation à donner dans l'app).
+          default: false
+          selector:
+            boolean:
+        open_on_ring:
+          name: Ouvrir l'interphone automatiquement sur Android
+          description: >
+            Affiche la vue de l'interphone dès la sonnerie, comme un appel
+            entrant (permission « superposition » requise sur le téléphone).
+          default: false
+          selector:
+            boolean:
+        missed_notification:
+          name: Notification d'appel manqué
+          default: true
+          selector:
+            boolean:
+    door:
+      name: Porte (optionnel)
+      icon: mdi:door
+      collapsed: true
+      input:
+        lock:
+          name: Serrure pour le bouton « Ouvrir la porte »
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: lock
+        open_action:
+          name: Action de la serrure
+          default: open
+          selector:
+            select:
+              options:
+                - label: Ouvrir (déverrouiller et tirer le pêne)
+                  value: open
+                - label: Déverrouiller
+                  value: unlock
+
+mode: restart
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input ring_event
+    not_from: unavailable
+
+conditions:
+  - condition: template
+    value_template: >
+      {{ trigger.to_state is not none
+         and trigger.to_state.state not in ['unknown', 'unavailable']
+         and trigger.to_state.attributes.event_type == 'ring' }}
+
+variables:
+  camera: !input camera
+  dashboard: !input dashboard
+  lock_entity: !input lock
+  open_action: !input open_action
+  critical: !input critical
+  open_on_ring: !input open_on_ring
+  missed_notification: !input missed_notification
+  phones: !input notify_devices
+  doorbell_device: "{{ device_id(camera) }}"
+  tag: "ajax_doorbell_{{ camera | replace('camera.', '') }}"
+  answer_uri: "{{ dashboard ~ ('&' if '?' in dashboard else '?') ~ 'ajax_answer=' ~ camera }}"
+  action_dismiss: "AJAX_DOORBELL_DISMISS_{{ context.id }}"
+  action_open: "AJAX_DOORBELL_OPEN_{{ context.id }}"
+  notify_services: >
+    {{ phones | map('device_attr', 'name') | map('slugify')
+       | map('regex_replace', '^', 'notify.mobile_app_') | list }}
+  android_services: >
+    {% set ns = namespace(out=[]) %}
+    {% for phone in phones if device_attr(phone, 'manufacturer') != 'Apple' %}
+      {% set ns.out = ns.out + ['notify.mobile_app_' ~ (device_attr(phone, 'name') | slugify)] %}
+    {% endfor %}
+    {{ ns.out }}
+  buttons: >
+    {% set ns = namespace(out=[
+      {'action': 'URI', 'title': 'Décrocher', 'uri': answer_uri},
+      {'action': 'URI', 'title': 'Voir', 'uri': dashboard},
+      {'action': action_dismiss, 'title': 'Ignorer'}]) %}
+    {% if lock_entity %}
+      {% set ns.out = ns.out + [{'action': action_open, 'title': 'Ouvrir la porte',
+                                 'destructive': true, 'authenticationRequired': true}] %}
+    {% endif %}
+    {{ ns.out }}
+
+actions:
+  - repeat:
+      for_each: "{{ notify_services }}"
+      sequence:
+        - action: "{{ repeat.item }}"
+          continue_on_error: true
+          data:
+            title: !input title
+            message: !input message
+            data:
+              tag: "{{ tag }}"
+              group: ajax_doorbell
+              # Android: snapshot, high priority, dedicated channel
+              image: "/api/camera_proxy/{{ camera }}"
+              clickAction: "{{ answer_uri }}"
+              channel: Sonnette
+              importance: high
+              priority: high
+              ttl: 0
+              visibility: public
+              notification_icon: mdi:doorbell-video
+              # iOS: live camera when expanded, time-sensitive or critical
+              entity_id: "{{ camera }}"
+              url: "{{ answer_uri }}"
+              push:
+                interruption-level: "{{ 'critical' if critical else 'time-sensitive' }}"
+                sound:
+                  name: default
+                  critical: "{{ 1 if critical else 0 }}"
+                  volume: 1.0
+              actions: "{{ buttons }}"
+  - if:
+      - condition: template
+        value_template: "{{ open_on_ring and android_services | count > 0 }}"
+    then:
+      - repeat:
+          for_each: "{{ android_services }}"
+          sequence:
+            - action: "{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: command_webview
+                data:
+                  command: "{{ dashboard }}"
+  - wait_for_trigger:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "{{ action_dismiss }}"
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "{{ action_open }}"
+      - trigger: event
+        event_type: ajax_doorbell_call
+        event_data:
+          device_id: "{{ doorbell_device }}"
+          type: answered
+      - trigger: event
+        event_type: ajax_doorbell_call
+        event_data:
+          device_id: "{{ doorbell_device }}"
+          type: dismissed
+      - trigger: event
+        event_type: ajax_doorbell_call
+        event_data:
+          device_id: "{{ doorbell_device }}"
+          type: missed
+    timeout: "00:05:00"
+    continue_on_timeout: true
+  - variables:
+      outcome: >
+        {% if wait.trigger is none %}timeout
+        {% elif wait.trigger.event.event_type == 'ajax_doorbell_call' %}{{ wait.trigger.event.data.type }}
+        {% elif wait.trigger.event.data.action == action_open %}open
+        {% else %}dismiss{% endif %}
+  - choose:
+      - conditions: "{{ outcome == 'dismiss' }}"
+        sequence:
+          - action: ajax_doorbell.dismiss
+            continue_on_error: true
+            target:
+              entity_id: !input call_sensor
+      - conditions: "{{ outcome == 'open' and lock_entity != '' }}"
+        sequence:
+          - action: "lock.{{ open_action }}"
+            target:
+              entity_id: "{{ lock_entity }}"
+  - repeat:
+      for_each: "{{ notify_services }}"
+      sequence:
+        - action: "{{ repeat.item }}"
+          continue_on_error: true
+          data:
+            message: clear_notification
+            data:
+              tag: "{{ tag }}"
+  - if:
+      - condition: template
+        value_template: "{{ outcome == 'missed' and missed_notification }}"
+    then:
+      - repeat:
+          for_each: "{{ notify_services }}"
+          sequence:
+            - action: "{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                title: Appel manqué
+                message: "On a sonné à {{ now().strftime('%H:%M') }}."
+                data:
+                  tag: "{{ tag }}_missed"
+                  group: ajax_doorbell
+                  image: "/api/camera_proxy/{{ camera }}"
+                  entity_id: "{{ camera }}"
+                  url: "{{ dashboard }}"
+                  clickAction: "{{ dashboard }}"
+                  channel: Sonnette manquée
+                  notification_icon: mdi:phone-missed

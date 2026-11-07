@@ -15,6 +15,13 @@ from .rtsp import strip_credentials
 TO_REDACT = {CONF_PASSWORD, CONF_USERNAME, "serial", "mac", "unique_id"}
 
 
+def _hide_mac(uri: str, mac: str | None) -> str:
+    """Ajax builds stream paths from the MAC address."""
+    if not mac:
+        return uri
+    return uri.replace(mac.replace(":", "").lower(), "**REDACTED**")
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: AjaxDoorbellConfigEntry
 ) -> dict[str, Any]:
@@ -38,7 +45,8 @@ async def async_get_config_entry_diagnostics(
         ),
         "profiles": [asdict(profile) for profile in doorbell.profiles],
         "stream_uris": {
-            token: strip_credentials(uri) for token, uri in doorbell.stream_uris.items()
+            token: _hide_mac(strip_credentials(uri), doorbell.mac)
+            for token, uri in doorbell.stream_uris.items()
         },
         "snapshot_uri": bool(doorbell.snapshot_uri),
         "rtsp_describe": {
