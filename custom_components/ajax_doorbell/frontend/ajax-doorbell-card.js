@@ -34,7 +34,7 @@
  * it the card still shows the video and plays the sound.
  */
 
-const CARD_VERSION = "0.2.3";
+const CARD_VERSION = "0.2.4";
 const DOMAIN = "ajax_doorbell";
 
 const KEEPALIVE_MS = 60000; // re-answer during our call: the integration ends unattended calls
@@ -1324,6 +1324,7 @@ const EDITOR_LABELS = {
     tone_westminster: "Westminster",
     tone_digital: "Digitale",
     tone_soft: "Douce",
+    test_ringtone: "Tester la sonnerie",
   },
   en: {
     camera: "Doorbell camera",
@@ -1346,6 +1347,7 @@ const EDITOR_LABELS = {
     tone_westminster: "Westminster",
     tone_digital: "Digital",
     tone_soft: "Soft",
+    test_ringtone: "Test the ringtone",
   },
 };
 
@@ -1357,6 +1359,10 @@ function editorLabel(name) {
 
 class AjaxDoorbellCard extends HTMLElement {
   /* ---------- Lovelace API ---------- */
+
+  static getConfigElement() {
+    return document.createElement("ajax-doorbell-card-editor");
+  }
 
   static getConfigForm() {
     const toggle = (name) => ({ name, selector: { boolean: {} } });
@@ -3679,6 +3685,96 @@ class AjaxDoorbellCard extends HTMLElement {
 if (!customElements.get("ajax-doorbell-card")) {
   customElements.define("ajax-doorbell-card", AjaxDoorbellCard);
 }
+
+/**
+ * The card's visual editor: Home Assistant's form for the options (the
+ * getConfigForm schema), plus a button to hear the ringtone.
+ */
+class AjaxDoorbellCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this._config = null;
+    this._hass = null;
+    this._form = null;
+    this._player = null;
+  }
+
+  setConfig(config) {
+    this._config = config;
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (this._form) this._form.hass = hass;
+  }
+
+  connectedCallback() {
+    this._render();
+  }
+
+  disconnectedCallback() {
+    const player = this._player;
+    this._player = null;
+    if (player && player._audioCtx) player._audioCtx.close().catch(() => {});
+  }
+
+  _render() {
+    if (!this._config || !this.isConnected) return;
+    if (!this._form) {
+      const definition = AjaxDoorbellCard.getConfigForm();
+      const form = document.createElement("ha-form");
+      form.computeLabel = definition.computeLabel;
+      form.schema = definition.schema;
+      form.addEventListener("value-changed", (event) => {
+        this._config = event.detail.value;
+        this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: this._config }, bubbles: true, composed: true }));
+      });
+      const test = document.createElement("button");
+      test.type = "button";
+      test.className = "test";
+      test.textContent = `▶ ${editorLabel("test_ringtone")}`;
+      test.addEventListener("click", () => this._test());
+      const style = document.createElement("style");
+      style.textContent = `
+        .test {
+          margin-top: 12px;
+          padding: 8px 16px;
+          border: 0;
+          border-radius: 18px;
+          background: var(--primary-color, #03a9f4);
+          color: var(--text-primary-color, #fff);
+          font: inherit;
+          font-weight: 500;
+          cursor: pointer;
+        }
+        .test:hover { filter: brightness(1.1); }
+      `;
+      this.append(style, form, test);
+      this._form = form;
+    }
+    this._form.hass = this._hass;
+    this._form.data = this._config;
+  }
+
+  /** Play one ring with the settings being edited (a click: audio may start). */
+  _test() {
+    if (!this._config || !this._config.camera) return;
+    if (!this._player) this._player = document.createElement("ajax-doorbell-card");
+    try {
+      this._player.setConfig(this._config);
+    } catch (err) {
+      return; // no camera chosen yet
+    }
+    this._player._hass = this._hass;
+    this._player._previewRingtone();
+  }
+}
+
+if (!customElements.get("ajax-doorbell-card-editor")) {
+  customElements.define("ajax-doorbell-card-editor", AjaxDoorbellCardEditor);
+}
+
 
 window.customCards = window.customCards || [];
 if (!window.customCards.some((card) => card.type === "ajax-doorbell-card")) {
