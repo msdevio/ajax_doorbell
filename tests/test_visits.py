@@ -96,9 +96,13 @@ async def test_visits_and_replay(
     first = (await client.receive_json())["event"]
     assert first["visits"] == [] and first["nvr"] is False and first["nvr_configured"]
 
-    doorbell.nvr = nvr
-    doorbell._notify_replay()
-    await client.receive_json()  # the NVR is there now
+    replay_camera = hass.data["camera"].get_entity(replay)
+    with patch.object(type(replay_camera), "async_refresh_providers", AsyncMock()) as refresh:
+        doorbell.nvr = nvr
+        doorbell._notify_replay()
+        await client.receive_json()  # the NVR is there now
+        await hass.async_block_till_done()
+    refresh.assert_awaited()  # WebRTC provider picked again, now that there is a source
     doorbell._on_event(
         OnvifEvent(
             "tns1:RuleEngine/ObjectDetection/Object", "Changed", None, {}, {"ClassTypes": "Human"}
@@ -127,7 +131,6 @@ async def test_visits_and_replay(
         result = await client.receive_json()
     assert result["result"] == {"camera": replay}
     await hass.async_block_till_done()
-    replay_camera = hass.data["camera"].get_entity(replay)
     assert await replay_camera.stream_source() == nvr.replay_url(dt_util.parse_datetime(start))
     assert hass.states.get(replay).attributes["replay_start"] == start
     doorbell.call.shutdown()

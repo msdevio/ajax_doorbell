@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import re
 import time
@@ -439,6 +439,10 @@ class AjaxDoorbell:
                 delay = min(delay * 2, 900)
                 continue
             self.nvr, self.nvr_error = nvr, None
+            if self.replay_start is None:
+                # A moment to replay from the start, so the replay camera has a source.
+                last = self.visits.visits[-1].start if self.visits.visits else dt_util.utcnow()
+                self.replay_start = last - timedelta(seconds=60)
             _LOGGER.info("%s: recordings available from the NVR %s", self.entry.title, nvr.host)
             self._notify_replay()
             return

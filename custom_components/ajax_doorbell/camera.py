@@ -125,6 +125,9 @@ class AjaxReplayCamera(AjaxDoorbellEntity, Camera):
 
     @callback
     def _replay_changed(self) -> None:
+        # Home Assistant picks a camera's WebRTC provider from its stream source,
+        # which only exists once the NVR answers: ask it again.
+        self.hass.async_create_task(self.async_refresh_providers())
         self.async_write_ha_state()
 
     @property
