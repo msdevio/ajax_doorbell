@@ -138,8 +138,10 @@ variables:
   doorbell_device: "{{ device_id(camera) }}"
   tag: "ajax_doorbell_{{ camera | replace('camera.', '') }}"
   answer_uri: "{{ dashboard ~ ('&' if '?' in dashboard else '?') ~ 'ajax_answer=' ~ camera }}"
-  action_dismiss: "AJAX_DOORBELL_DISMISS_{{ context.id }}"
-  action_open: "AJAX_DOORBELL_OPEN_{{ context.id }}"
+  # One id per run, so a button only acts on its own notification.
+  run_id: "{{ now().timestamp() | round(3) | replace('.', '') }}"
+  action_dismiss: "AJAX_DOORBELL_DISMISS_{{ run_id }}"
+  action_open: "AJAX_DOORBELL_OPEN_{{ run_id }}"
   notify_services: >
     {{ phones | map('device_attr', 'name') | map('slugify')
        | map('regex_replace', '^', 'notify.mobile_app_') | list }}
