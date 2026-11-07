@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import urllib.error
+from urllib.parse import urlsplit
 import urllib.request
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
@@ -574,6 +575,7 @@ class Findings:
     bitrate: str = "?"
     startup: str = "?"
     profile_g: str = "no"
+    replay: str = "not tried"
     beep: str = "not run"
     errors: list[str] = field(default_factory=list)
 
@@ -1296,6 +1298,36 @@ def step_beep(args, f: Findings, uri: str) -> None:
     )
 
 
+def onvif_time(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(value: str) -> dt.datetime | None:
+    try:
+        moment = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=dt.UTC)
+
+
+def search_results(cam: Onvif, call: str, token: str, item: str) -> list[ET.Element]:
+    """Collect the results of a FindRecordings / FindEvents search, then end it."""
+    tse = 'xmlns="http://www.onvif.org/ver10/search/wsdl"'
+    found: list[ET.Element] = []
+    for _ in range(10):
+        root = cam.call(
+            "search",
+            f"<{call} {tse}><SearchToken>{token}</SearchToken><MinResults>1</MinResults>"
+            f"<MaxResults>100</MaxResults><WaitTime>PT5S</WaitTime></{call}>",
+        )
+        found += list(iter_local(root, item))
+        if text(root, "SearchState") in ("Completed", ""):
+            break
+    with suppress(OnvifError):
+        cam.call("search", f"<EndSearch {tse}><SearchToken>{token}</SearchToken></EndSearch>")
+    return found
+
+
 def step_nvr(cam: Onvif, args, f: Findings) -> None:
     section("NVR recordings (Profile G)")
     if "search" not in cam.xaddr:
@@ -1304,49 +1336,146 @@ def step_nvr(cam: Onvif, args, f: Findings) -> None:
     tse = 'xmlns="http://www.onvif.org/ver10/search/wsdl"'
     summary = cam.call("search", f"<GetRecordingSummary {tse}/>")
     print(
-        f"summary: from {text(summary, 'DataFrom')} until {text(summary, 'DataUntil')}, {text(summary, 'NumberRecordings')} recording(s)"
+        f"summary: from {text(summary, 'DataFrom')} until {text(summary, 'DataUntil')}, "
+        f"{text(summary, 'NumberRecordings')} recording(s)"
     )
     found = cam.call(
         "search",
-        f"<FindRecordings {tse}><Scope/><MaxMatches>32</MaxMatches><KeepAliveTime>PT10S</KeepAliveTime></FindRecordings>",
+        f"<FindRecordings {tse}><Scope/><MaxMatches>32</MaxMatches>"
+        "<KeepAliveTime>PT10S</KeepAliveTime></FindRecordings>",
     )
-    token = text(found, "SearchToken")
-    results = cam.call(
-        "search",
-        f"<GetRecordingSearchResults {tse}><SearchToken>{token}</SearchToken><MinResults>1</MinResults><MaxResults>32</MaxResults><WaitTime>PT5S</WaitTime></GetRecordingSearchResults>",
-    )
-    recordings = []
-    for rec in iter_local(results, "RecordingInformation"):
-        rtoken = text(rec, "RecordingToken")
-        recordings.append(rtoken)
+    recordings: list[tuple[str, str, ET.Element]] = []
+    for rec in search_results(
+        cam, "GetRecordingSearchResults", text(found, "SearchToken"), "RecordingInformation"
+    ):
+        token = text(rec, "RecordingToken")
+        source = first(rec, "Source")
+        name = " / ".join(filter(None, (text(source, "Name"), text(source, "Description"))))
+        recordings.append((token, name, rec))
         print(
-            f"- {rtoken}: {text(first(rec, 'Source'), 'Name')} {text(rec, 'EarliestRecording')} -> {text(rec, 'LatestRecording')} {text(rec, 'RecordingStatus')}"
+            f"- {token}: {name} {text(rec, 'EarliestRecording')} -> "
+            f"{text(rec, 'LatestRecording')} {text(rec, 'RecordingStatus')}"
         )
-    f.profile_g = f"{len(recordings)} recording(s) listed"
-    if not recordings or "replay" not in cam.xaddr:
+        for track in iter_local(rec, "Track"):
+            print(
+                f"    track {text(track, 'TrackToken')} {text(track, 'TrackType')} "
+                f"{text(track, 'DataFrom')} -> {text(track, 'DataTo')}"
+            )
+    f.profile_g = f"{len(recordings)} recording(s)"
+    if not recordings:
         return
+
+    # Which events does the NVR index? (rings and motion would give a clip list)
+    until = parse_time(text(summary, "DataUntil")) or dt.datetime.now(dt.UTC)
+    events: list[tuple[str, str, str]] = []
+    try:
+        search = cam.call(
+            "search",
+            f"<FindEvents {tse}><StartPoint>{onvif_time(until - dt.timedelta(days=1))}"
+            f"</StartPoint><EndPoint>{onvif_time(until)}</EndPoint><Scope/><SearchFilter/>"
+            "<IncludeStartState>false</IncludeStartState><MaxMatches>500</MaxMatches>"
+            "<KeepAliveTime>PT10S</KeepAliveTime></FindEvents>",
+        )
+        for result in search_results(
+            cam, "GetEventSearchResults", text(search, "SearchToken"), "FindEventResult"
+        ):
+            topic_node = first(result, "Topic")
+            topic = (topic_node.text or "").strip() if topic_node is not None else "?"
+            data = first(result, "Data")
+            items = " ".join(
+                f"{item.get('Name')}={item.get('Value')}"
+                for item in iter_local(result if data is None else data, "SimpleItem")
+            )
+            events.append(
+                (text(result, "Time"), topic, f"{text(result, 'RecordingToken')} {items}")
+            )
+    except OnvifError as err:
+        print(f"FindEvents: {err}")
+    counts: dict[str, int] = {}
+    for _, topic, _ in events:
+        counts[topic] = counts.get(topic, 0) + 1
+    print(f"events indexed over the last 24 h: {len(events)}")
+    for topic, count in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"    {count:4d}  {topic}")
+    for moment, topic, rest in sorted(events)[-8:]:
+        print(f"    {moment} {topic} {rest}")
+    rings = [moment for moment, topic, _ in events if "Ring" in topic]
+    f.profile_g += f", {len(events)} event(s) indexed in 24 h ({len(rings)} ring(s))"
+
+    if "replay" not in cam.xaddr:
+        return
+    doorbell = next(
+        (r for r in recordings if re.search(r"sonnette|doorbell", r[1], re.I)), recordings[0]
+    )
     trp = 'xmlns="http://www.onvif.org/ver10/replay/wsdl"'
     replay = cam.call(
         "replay",
-        f"<GetReplayUri {trp}><StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></StreamSetup><RecordingToken>{recordings[0]}</RecordingToken></GetReplayUri>",
+        f"<GetReplayUri {trp}><StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport>"
+        "<tt:Protocol>RTSP</tt:Protocol></tt:Transport></StreamSetup>"
+        f"<RecordingToken>{doorbell[0]}</RecordingToken></GetReplayUri>",
     )
-    uri = text(replay, "Uri")
-    print(f"replay uri: {hide(uri)}")
-    clean = re.sub(r"//[^/@]+@", "//", uri)
-    for require in (None, "onvif-replay"):
-        rtsp = Rtsp(args.host, args.rtsp_port, args.user, args.password)
-        try:
-            headers = {"Accept": "application/sdp"}
-            if require:
-                headers["Require"] = require
-            resp = rtsp.request("DESCRIBE", clean, headers)
-            print(f"DESCRIBE replay (Require={require}) -> {resp.status} {resp.reason}")
-            for media in parse_sdp(resp.body.decode(errors="replace")):
-                print(f"    m={media.kind} {media.payloads}")
-        except OSError as err:
-            print(f"DESCRIBE replay: {err}")
-        finally:
-            rtsp.close()
+    uri = re.sub(r"//[^/@]+@", "//", text(replay, "Uri"))
+    print(f"replay uri for {doorbell[0]} ({doorbell[1]}): {hide(uri)}")
+    target = until - dt.timedelta(minutes=5)
+    if rings and (ring := parse_time(sorted(rings)[-1])):
+        target = ring - dt.timedelta(seconds=5)
+    f.replay = replay_test(args, uri, target)
+    print(f"replay: {f.replay}")
+
+
+def replay_test(args, uri: str, start: dt.datetime) -> str:
+    """Play a recording from a wall-clock time, as a clip player would."""
+    parts = urlsplit(uri)
+    rtsp = Rtsp(parts.hostname or args.host, parts.port or 554, args.user, args.password)
+    require = {"Require": "onvif-replay"}
+    try:
+        resp = rtsp.request("DESCRIBE", uri, {"Accept": "application/sdp", **require})
+        print(f"DESCRIBE replay -> {resp.status} {resp.reason}")
+        if resp.status != 200:
+            return f"DESCRIBE refused ({resp.status})"
+        base = resp.headers.get("content-base", uri)
+        medias = [m for m in parse_sdp(resp.body.decode(errors="replace")) if m.kind == "video"]
+        for media in parse_sdp(resp.body.decode(errors="replace")):
+            print(f"    m={media.kind} {media.direction} {media.payloads} control={media.control}")
+        if not medias:
+            return "no video track"
+        setup = rtsp.request(
+            "SETUP",
+            media_url(base, medias[0].control),
+            {"Transport": "RTP/AVP/TCP;unicast;interleaved=0-1", **require},
+        )
+        if setup.status != 200:
+            return f"SETUP refused ({setup.status})"
+        clock = start.astimezone(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+        began = time.monotonic()
+        play = rtsp.request("PLAY", base, {"Range": f"clock={clock}-", **require})
+        print(f"PLAY from {clock} -> {play.status} {play.headers.get('range', '')}")
+        if play.status != 200:
+            return f"PLAY refused ({play.status})"
+        size, first_key, ntp = 0, None, None
+        for _, payload, received in rtsp.read_interleaved(began + 5):
+            if len(payload) < 12:
+                continue
+            size += len(payload)
+            header = 12 + 4 * (payload[0] & 0x0F)
+            if payload[0] & 0x10 and len(payload) >= header + 12:
+                profile = int.from_bytes(payload[header : header + 2], "big")
+                if profile == 0xABAC and ntp is None:  # ONVIF replay extension: NTP time
+                    seconds = int.from_bytes(payload[header + 4 : header + 8], "big")
+                    ntp = dt.datetime(1900, 1, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=seconds)
+                header += 4 + 4 * int.from_bytes(payload[header + 2 : header + 4], "big")
+            if first_key is None and 5 in nal_types(payload[header:]):
+                first_key = received - began
+        with suppress(OSError):
+            rtsp.request("TEARDOWN", base)
+        result = f"{size // 1024} KB in 5 s"
+        if first_key is not None:
+            result += f", first keyframe {first_key * 1000:.0f} ms after PLAY"
+        if ntp is not None:
+            result += f", starts at {ntp.strftime('%H:%M:%S')} UTC ({(ntp - start).total_seconds():+.0f} s from the asked time)"
+        return result
+    finally:
+        rtsp.close()
 
 
 # ------------------------------------------------------------------------- main
@@ -1464,6 +1593,7 @@ def main() -> int:
         print(f"audio RTP clock {f.audio_clock or '?'}")
         print(f"video           {f.bitrate}; {f.gop}; {f.startup}")
         print(f"profile G       {f.profile_g}")
+        print(f"replay          {f.replay}")
         print(f"beep            {f.beep}")
         if f.errors:
             print(f"errors          {f.errors}")
