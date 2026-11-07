@@ -15,15 +15,19 @@ official ONVIF and RTSP interface: no Ajax cloud, no Ajax account password.
 - **Live video** through Home Assistant's built-in go2rtc over WebRTC. The H.264
   stream is copied as is, never re-encoded: about 0.3 s glass to glass on the LAN.
 - **Listen**: the DoorBell's G.722 audio reaches the browser as Opus.
-- **Talk**: the browser microphone goes back to the DoorBell speaker through the
-  ONVIF audio backchannel. The integration checks at setup that the DoorBell offers
-  one; on Home Assistant 2026.11 the camera then declares two-way audio, so Home
-  Assistant's own **Talk** button (Labs preview) works too.
-- **Ring within a second** from the DoorBell's local ONVIF event (`RingDetector`),
-  as an `event` entity of the `doorbell` class.
+- **Talk**: the browser microphone goes to the DoorBell speaker through its ONVIF
+  audio backchannel. The DoorBell only takes G.722 there, which go2rtc cannot make
+  from a browser, so the intercom card encodes the microphone itself (bit-exact with
+  FFmpeg's encoder) and the integration plays it on the backchannel, over Home
+  Assistant's own websocket: no extra port, and it works remotely too. One screen
+  talks at a time; the last one to answer takes over.
+- **Ring within half a second** (50 to 500 ms measured) from the DoorBell's local
+  ONVIF event (`RingDetector`), as an `event` entity of the `doorbell` class.
 - **Call state shared by all screens**: idle, ringing, in call. Answering on one
   screen stops the ringing everywhere; unanswered rings are counted as missed calls.
-- **Detections**: motion, person, vehicle and animal from the DoorBell's AI.
+- **Detections**: camera motion, PIR motion, and person, vehicle and animal from the
+  DoorBell's AI. The subscription asks only for these topics, which keeps the
+  DoorBell's live object tracking (several messages a second) off the network.
 - **Intercom card** `custom:ajax-doorbell-card` and a **notification blueprint**
   (Answer, View, Ignore, Open the door).
 - DHCP discovery, reauthentication, reconfiguration, diagnostics, English and French.
@@ -31,7 +35,7 @@ official ONVIF and RTSP interface: no Ajax cloud, no Ajax account password.
 ## Requirements
 
 - Ajax DoorBell with firmware 2.377 or later (ONVIF support).
-- Home Assistant 2026.10 or later. 2026.11 adds Home Assistant's own Talk button.
+- Home Assistant 2026.10 or later.
 - HTTPS to use the microphone in a browser or in the companion app.
 
 ## 1. Prepare the DoorBell in the Ajax app
@@ -66,7 +70,9 @@ address and the ONVIF user.
 | `sensor.<doorbell>_call` | `idle`, `ringing` or `in_call`, with `answered_by` and times |
 | `sensor.<doorbell>_last_ring` | Time of the last press |
 | `sensor.<doorbell>_missed_calls` | Unanswered rings since the counter was cleared |
-| `binary_sensor.<doorbell>_motion`, `_person`, `_vehicle`, `_animal` | Detections |
+| `binary_sensor.<doorbell>_motion` | Motion seen by the camera |
+| `binary_sensor.<doorbell>_pir_motion` | Motion seen by the PIR sensor |
+| `binary_sensor.<doorbell>_person`, `_vehicle`, `_animal` | AI detections |
 | `binary_sensor.<doorbell>_event_stream` | Health of the ONVIF event subscription (diagnostic) |
 
 ## Services
@@ -89,10 +95,9 @@ relevant.
 
 ## Intercom card
 
-1. Copy `card/ajax-doorbell-card.js` to your `config/www/` folder.
-2. **Settings → Dashboards → ⋮ → Resources → Add resource**:
-   `/local/ajax-doorbell-card.js`, type **JavaScript module**.
-3. Add the card to a view (a dedicated "Intercom" view works best):
+The integration serves the card and loads it on every dashboard: there is nothing
+to copy and no resource to add, and each update reaches the browsers at once. Add
+the card to a view (a dedicated "Intercom" view works best):
 
 ```yaml
 type: custom:ajax-doorbell-card
@@ -130,11 +135,16 @@ also open the intercom view by itself, like an incoming call.
 ## Troubleshooting
 
 - **No microphone**: the page must be served over HTTPS (or `http://localhost`).
-- **No Talk button or no sound at the door**: check the `two_way_audio` attribute of
-  the call sensor, and the backchannel in the diagnostics. Talk needs the DoorBell to
-  offer a G.711 or Opus backchannel.
+- **No Talk button or no sound at the door**: the call sensor must show
+  `two_way_audio: true` and `talk_via: relay`, and the diagnostics a `talk_codec`.
+  Home Assistant's own Talk button stays hidden for this DoorBell: its backchannel is
+  G.722, so talking goes through the intercom card.
+- **"Another screen took the microphone"**: only one screen talks at a time, the last
+  one to answer.
 - **Higher latency**: do not set a camera orientation in Home Assistant (it forces
-  the video to be re-encoded), and prefer the main stream over HLS players.
+  the video to be re-encoded), and prefer the main stream over HLS players. The
+  DoorBell sends a keyframe about 130 ms after a new connection, so the video starts
+  fastest with **Preload stream** off; with it on, a 1 s GOP keeps the start short.
 - **Remote access on 4G**: media flows directly over WebRTC. Behind a strict mobile
   NAT, declare a TURN server under `web_rtc: ice_servers:` in `configuration.yaml`.
 - **Event stream offline**: the ONVIF user may lack the rights to subscribe to events:
@@ -143,7 +153,8 @@ also open the intercom view by itself, like an incoming call.
 ## How it works
 
 ```
-DoorBell ── RTSP 8554 (H.264, G.722, backchannel) ──► go2rtc ── WebRTC ──► browser
+DoorBell ── RTSP 8554 (H.264, G.722) ──► go2rtc ── WebRTC ──► browser (video, listening)
+browser ── websocket (G.722 frames) ──► ajax_doorbell ── RTSP backchannel ──► DoorBell speaker
 DoorBell ── ONVIF 8080 (PullPoint events) ──► ajax_doorbell ──► entities, call state, notification
 ```
 

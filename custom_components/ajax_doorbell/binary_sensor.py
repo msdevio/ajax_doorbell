@@ -1,4 +1,4 @@
-"""Binary sensors: incoming call, motion, AI detections, event stream health."""
+"""Binary sensors: incoming call, motion, PIR, AI detections, event stream health."""
 
 from __future__ import annotations
 
@@ -42,12 +42,14 @@ def _detection(
         is_on=lambda doorbell: doorbell.detections.state[key],
         subscribe=lambda doorbell, cb: doorbell.detections.async_add_listener(cb),
         available=lambda doorbell: doorbell.events.connected,
-        exists=(
-            (lambda doorbell: True)
-            if key == "motion"
-            else (lambda doorbell: doorbell.has_object_detection)
-        ),
+        exists=_DETECTION_EXISTS.get(key, lambda doorbell: doorbell.has_object_detection),
     )
+
+
+_DETECTION_EXISTS: dict[str, Callable[[AjaxDoorbell], bool]] = {
+    "motion": lambda doorbell: True,
+    "pir": lambda doorbell: doorbell.has_pir,
+}
 
 
 DESCRIPTIONS: tuple[AjaxBinarySensorDescription, ...] = (
@@ -59,6 +61,7 @@ DESCRIPTIONS: tuple[AjaxBinarySensorDescription, ...] = (
         exists=lambda doorbell: doorbell.is_doorbell,
     ),
     _detection("motion", BinarySensorDeviceClass.MOTION),
+    _detection("pir", BinarySensorDeviceClass.MOTION),
     _detection("person"),
     _detection("vehicle"),
     _detection("pet"),

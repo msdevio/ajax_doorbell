@@ -48,11 +48,217 @@ const STATS_MS = 2000;
 const FLASH_MS = 3500;
 const RING_REPEAT_MS = 3000;
 const FS_FALLBACK_MS = 1000;
+const TALK_READY_MS = 8000;
 
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   video: false,
 };
+
+/* Source of the talk-back AudioWorklet (G.722 / G.711 encoders, bit-exact with FFmpeg). */
+const TALK_WORKLET = `
+function createG722Encoder() {
+  const QMF = [3, -11, 12, 32, -210, 951, 3876, -805, 362, -156, 53, -11];
+  const Q6 = [0, 35, 72, 110, 150, 190, 233, 276, 323, 370, 422, 473, 530, 587, 650, 714, 786, 858,
+    940, 1023, 1121, 1219, 1339, 1458, 1612, 1765, 1980, 2195, 2557, 2919, 0, 0];
+  const ILN = [0, 63, 62, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14,
+    13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 0];
+  const ILP = [0, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43, 42,
+    41, 40, 39, 38, 37, 36, 35, 34, 33, 32, 0];
+  const WL = [-60, -30, 58, 172, 334, 538, 1198, 3042];
+  const RL42 = [0, 7, 6, 5, 4, 3, 2, 1, 7, 6, 5, 4, 3, 2, 1, 0];
+  const ILB = [2048, 2093, 2139, 2186, 2233, 2282, 2332, 2383, 2435, 2489, 2543, 2599, 2656, 2714,
+    2774, 2834, 2896, 2960, 3025, 3091, 3158, 3228, 3298, 3371, 3444, 3520, 3597, 3676, 3756,
+    3838, 3922, 4008];
+  const QM4 = [0, -20456, -12896, -8968, -6288, -4240, -2584, -1200, 20456, 12896, 8968, 6288,
+    4240, 2584, 1200, 0];
+  const QM2 = [-7408, -1616, 7408, 1616];
+  const IHN = [0, 1, 0];
+  const IHP = [0, 3, 2];
+  const WH = [0, -214, 798];
+  const RH2 = [2, 1, 2, 1];
+  const sat = (v) => (v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+  const band = (det) => ({
+    s: 0, sp: 0, sz: 0, nb: 0, det,
+    r: [0, 0, 0], a: [0, 0, 0], ap: [0, 0, 0], p: [0, 0, 0],
+    d: [0, 0, 0, 0, 0, 0, 0], b: [0, 0, 0, 0, 0, 0, 0], bp: [0, 0, 0, 0, 0, 0, 0],
+  });
+  // Block 4: reconstruct, adapt the pole and zero predictors, predict.
+  const update = (t, d) => {
+    const { r, a, ap, p, b, bp } = t;
+    const dd = t.d;
+    dd[0] = d;
+    r[0] = sat(t.s + d);
+    p[0] = sat(t.sz + d);
+    const sg0 = p[0] >> 15;
+    const sg1 = p[1] >> 15;
+    const sg2 = p[2] >> 15;
+    const wd1 = sat(a[1] << 2);
+    let wd2 = sg0 === sg1 ? -wd1 : wd1;
+    if (wd2 > 32767) wd2 = 32767;
+    const wd3 = (wd2 >> 7) + (sg0 === sg2 ? 128 : -128) + ((a[2] * 32512) >> 15);
+    ap[2] = wd3 > 12288 ? 12288 : wd3 < -12288 ? -12288 : wd3;
+    ap[1] = sat((sg0 === sg1 ? 192 : -192) + ((a[1] * 32640) >> 15));
+    const limit = sat(15360 - ap[2]);
+    if (ap[1] > limit) ap[1] = limit;
+    else if (ap[1] < -limit) ap[1] = -limit;
+    const step = d === 0 ? 0 : 128;
+    const sgd = d >> 15;
+    for (let i = 1; i < 7; i++) bp[i] = sat((dd[i] >> 15 === sgd ? step : -step) + ((b[i] * 32640) >> 15));
+    for (let i = 6; i > 0; i--) {
+      dd[i] = dd[i - 1];
+      b[i] = bp[i];
+    }
+    for (let i = 2; i > 0; i--) {
+      r[i] = r[i - 1];
+      p[i] = p[i - 1];
+      a[i] = ap[i];
+    }
+    t.sp = sat(((a[1] * sat(r[1] + r[1])) >> 15) + ((a[2] * sat(r[2] + r[2])) >> 15));
+    let sz = 0;
+    for (let i = 6; i > 0; i--) sz += (b[i] * sat(dd[i] + dd[i])) >> 15;
+    t.sz = sat(sz);
+    t.s = sat(t.sp + t.sz);
+  };
+  const x = new Int32Array(24);
+  const low = band(32);
+  const high = band(8);
+  return (samples, out) => {
+    let n = 0;
+    for (let j = 0; j + 1 < samples.length; j += 2) {
+      x.copyWithin(0, 2);
+      x[22] = samples[j];
+      x[23] = samples[j + 1];
+      let sumodd = 0;
+      let sumeven = 0;
+      for (let i = 0; i < 12; i++) {
+        sumodd += x[2 * i] * QMF[i];
+        sumeven += x[2 * i + 1] * QMF[11 - i];
+      }
+      const xlow = (sumeven + sumodd) >> 14;
+      const xhigh = (sumeven - sumodd) >> 14;
+
+      const el = sat(xlow - low.s);
+      let wd = el >= 0 ? el : -(el + 1);
+      let i = 1;
+      while (i < 30 && wd >= (Q6[i] * low.det) >> 12) i++;
+      const ilow = el < 0 ? ILN[i] : ILP[i];
+      const ril = ilow >> 2;
+      const dlow = (low.det * QM4[ril]) >> 15;
+      low.nb = ((low.nb * 127) >> 7) + WL[RL42[ril]];
+      low.nb = low.nb < 0 ? 0 : low.nb > 18432 ? 18432 : low.nb;
+      let shift = 8 - (low.nb >> 11);
+      let base = ILB[(low.nb >> 6) & 31];
+      low.det = (shift < 0 ? base << -shift : base >> shift) << 2;
+      update(low, dlow);
+
+      const eh = sat(xhigh - high.s);
+      wd = eh >= 0 ? eh : -(eh + 1);
+      const ihigh = (eh < 0 ? IHN : IHP)[wd >= (564 * high.det) >> 12 ? 2 : 1];
+      const dhigh = (high.det * QM2[ihigh]) >> 15;
+      high.nb = ((high.nb * 127) >> 7) + WH[RH2[ihigh]];
+      high.nb = high.nb < 0 ? 0 : high.nb > 22528 ? 22528 : high.nb;
+      shift = 10 - (high.nb >> 11);
+      base = ILB[(high.nb >> 6) & 31];
+      high.det = (shift < 0 ? base << -shift : base >> shift) << 2;
+      update(high, dhigh);
+
+      out[n++] = (ihigh << 6) | ilow;
+    }
+    return n;
+  };
+}
+
+function createG711Encoder(codec) {
+  const alaw = (pcm) => {
+    let mask = 0xd5;
+    let v = pcm >> 3;
+    if (v < 0) {
+      mask = 0x55;
+      v = -v - 1;
+    }
+    const ends = [0x1f, 0x3f, 0x7f, 0xff, 0x1ff, 0x3ff, 0x7ff, 0xfff];
+    let seg = 0;
+    while (seg < 8 && v > ends[seg]) seg++;
+    if (seg >= 8) return 0x7f ^ mask;
+    return ((seg << 4) | ((seg < 2 ? v >> 1 : v >> seg) & 0x0f)) ^ mask;
+  };
+  const ulaw = (pcm) => {
+    let mask = 0xff;
+    let v = pcm >> 2;
+    if (v < 0) {
+      v = -v;
+      mask = 0x7f;
+    }
+    v = Math.min(v, 8159) + 0x21;
+    const ends = [0x3f, 0x7f, 0xff, 0x1ff, 0x3ff, 0x7ff, 0xfff, 0x1fff];
+    let seg = 0;
+    while (seg < 8 && v > ends[seg]) seg++;
+    if (seg >= 8) return 0x7f ^ mask;
+    return ((seg << 4) | ((v >> (seg + 1)) & 0x0f)) ^ mask;
+  };
+  const one = codec === "PCMU" ? ulaw : alaw;
+  return (samples, out) => {
+    for (let i = 0; i < samples.length; i++) out[i] = one(samples[i]);
+    return samples.length;
+  };
+}
+
+// Resamples the microphone to the codec rate, encodes 20 ms frames (160 bytes)
+// and posts them. Muted, it keeps sending encoded silence so the DoorBell's
+// G.722 decoder never loses step.
+class AjaxDoorbellTalk extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const codec = (options.processorOptions && options.processorOptions.codec) || "G722";
+    this.rate = codec === "G722" ? 16000 : 8000;
+    this.step = sampleRate / this.rate;
+    this.t = 0;
+    this.prev = 0;
+    this.frame = new Int16Array(codec === "G722" ? 320 : 160);
+    this.fill = 0;
+    this.encode = codec === "G722" ? createG722Encoder() : createG711Encoder(codec);
+    this.live = false;
+    this.stopped = false;
+    this.port.onmessage = (event) => {
+      const data = event.data || {};
+      if (typeof data.live === "boolean") this.live = data.live;
+      if (data.stop) this.stopped = true;
+    };
+  }
+
+  push(value) {
+    const v = value > 1 ? 1 : value < -1 ? -1 : value;
+    this.frame[this.fill++] = this.live ? Math.round(v * 32767) : 0;
+    if (this.fill === this.frame.length) {
+      const bytes = new Uint8Array(160);
+      this.encode(this.frame, bytes);
+      this.port.postMessage(bytes.buffer, [bytes.buffer]);
+      this.fill = 0;
+    }
+  }
+
+  process(inputs) {
+    if (this.stopped) return false;
+    const input = inputs[0] && inputs[0][0];
+    if (!input || !input.length) return true;
+    const n = input.length;
+    let t = this.t;
+    // Linear interpolation; the card low-passes the input before any decimation.
+    while (t < n - 1) {
+      const i = Math.floor(t);
+      const a = i < 0 ? this.prev : input[i];
+      this.push(a + (input[i + 1] - a) * (t - i));
+      t += this.step;
+    }
+    this.t = t - n;
+    this.prev = input[n - 1];
+    return true;
+  }
+}
+
+registerProcessor("ajax-doorbell-talk", AjaxDoorbellTalk);
+`;
 
 const ICONS = {
   answer: "mdi:phone",
@@ -113,6 +319,9 @@ const STRINGS = {
     mic_busy: "Le micro est utilisé par une autre application.",
     mic_unsupported: "Ce navigateur ne donne pas accès au micro.",
     mic_failed: "Micro indisponible ({name}).",
+    mic_taken: "Le micro a été repris sur un autre écran.",
+    mic_ended: "La sonnette a coupé le micro.",
+    mic_relay: "La sonnette refuse le micro : {message}",
     err_ice: "Impossible de joindre la sonnette (réseau).",
     err_lost: "Connexion perdue.",
     err_timeout: "La sonnette ne répond pas.",
@@ -170,6 +379,9 @@ const STRINGS = {
     mic_busy: "The microphone is used by another app.",
     mic_unsupported: "This browser gives no access to the microphone.",
     mic_failed: "Microphone unavailable ({name}).",
+    mic_taken: "Another screen took the microphone.",
+    mic_ended: "The doorbell closed the microphone.",
+    mic_relay: "The doorbell refused the microphone: {message}",
     err_ice: "Can't reach the doorbell (network).",
     err_lost: "Connection lost.",
     err_timeout: "The doorbell is not answering.",
@@ -198,9 +410,157 @@ const EMPTY_CALL = Object.freeze({
   answeredBy: null,
   answeredAt: null,
   twoWay: undefined,
+  talkVia: null,
 });
 
 const debug = (...args) => console.debug("[ajax-doorbell-card]", ...args);
+
+/**
+ * Talk-back through the integration: the DoorBell only takes G.722, which
+ * go2rtc cannot make from a browser, so the microphone is encoded here and
+ * sent as 20 ms binary frames on the Home Assistant websocket.
+ */
+class TalkRelay {
+  constructor(hass, entityId, name, onEnded) {
+    this._hass = hass;
+    this._entityId = entityId;
+    this._name = name;
+    this._onEnded = onEnded;
+    this._live = false;
+    this._closed = false;
+    this.ready = false;
+    this.codec = null;
+  }
+
+  async start(track) {
+    let resolveReady;
+    let rejectReady;
+    const ready = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    const timer = setTimeout(() => rejectReady(new Error("timeout")), TALK_READY_MS);
+    try {
+      const unsub = await this._hass.connection.subscribeMessage(
+        (event) => {
+          if (event.type === "ready") {
+            this._handler = event.handler_id; // also after a websocket reconnect
+            resolveReady(event);
+          } else if (event.type === "ended") {
+            this._end(event.reason);
+          }
+        },
+        { type: `${DOMAIN}/talk`, entity_id: this._entityId, name: this._name },
+      );
+      this._unsub = unsub;
+      if (this._closed) return this.stop();
+      const info = await ready;
+      if (this._closed) return undefined;
+      this.codec = info.codec;
+      await this._startAudio(track, info.codec, info.sample_rate);
+      if (this._closed) return this.stop();
+      this.ready = true;
+      this._node.port.postMessage({ live: this._live });
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _startAudio(track, codec, rate) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const stream = new MediaStream([track]);
+    let ctx = null;
+    let source = null;
+    try {
+      ctx = new Ctx({ sampleRate: rate, latencyHint: "interactive" });
+      source = ctx.createMediaStreamSource(stream);
+    } catch (err) {
+      // Firefox refuses a microphone in a context at another rate: resample here.
+      if (ctx) ctx.close().catch(() => {});
+      ctx = new Ctx({ latencyHint: "interactive" });
+      source = ctx.createMediaStreamSource(stream);
+    }
+    this._ctx = ctx;
+    this._source = source;
+    const url = URL.createObjectURL(new Blob([TALK_WORKLET], { type: "text/javascript" }));
+    try {
+      await ctx.audioWorklet.addModule(url);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    if (this._closed) return;
+    const node = new AudioWorkletNode(ctx, "ajax-doorbell-talk", { processorOptions: { codec } });
+    node.port.onmessage = (event) => this._send(event.data);
+    this._node = node;
+    let head = source;
+    if (ctx.sampleRate > rate) {
+      // A 4th-order Butterworth low-pass below the new Nyquist frequency.
+      for (const q of [0.5412, 1.3066]) {
+        const filter = ctx.createBiquadFilter();
+        filter.type = "lowpass";
+        filter.frequency.value = rate * 0.45;
+        filter.Q.value = q;
+        head.connect(filter);
+        head = filter;
+      }
+    }
+    head.connect(node);
+    if (ctx.state === "suspended") await ctx.resume().catch(() => {});
+  }
+
+  /** Speak (true) or send silence (false); the session stays open. */
+  setLive(live) {
+    this._live = live;
+    if (this._node) this._node.port.postMessage({ live });
+  }
+
+  _send(buffer) {
+    if (!this.ready || this._closed || !this._handler) return;
+    const socket = this._hass.connection && this._hass.connection.socket;
+    if (!socket || socket.readyState !== 1) return;
+    const message = new Uint8Array(buffer.byteLength + 1);
+    message[0] = this._handler;
+    message.set(new Uint8Array(buffer), 1);
+    socket.send(message);
+  }
+
+  stop() {
+    this._closed = true;
+    this.ready = false;
+    const unsub = this._unsub;
+    this._unsub = null;
+    if (unsub) Promise.resolve().then(unsub).catch(() => {});
+    if (this._node) {
+      this._node.port.onmessage = null;
+      this._node.port.postMessage({ stop: true });
+      try {
+        this._node.disconnect();
+      } catch (err) {
+        /* ignore */
+      }
+      this._node = null;
+    }
+    if (this._source) {
+      try {
+        this._source.disconnect();
+      } catch (err) {
+        /* ignore */
+      }
+      this._source = null;
+    }
+    if (this._ctx) {
+      this._ctx.close().catch(() => {});
+      this._ctx = null;
+    }
+  }
+
+  _end(reason) {
+    if (this._closed) return;
+    this.stop();
+    this._onEnded(reason);
+  }
+}
 
 let deviceKind = null;
 
@@ -1085,11 +1445,17 @@ class AjaxDoorbellCard extends HTMLElement {
       answeredBy: attrs.answered_by || null,
       answeredAt: attrs.answered_at || null,
       twoWay: typeof attrs.two_way_audio === "boolean" ? attrs.two_way_audio : undefined,
+      talkVia: attrs.talk_via || null,
     };
   }
 
   _ringKey() {
     return this._call.ringStarted || "ring";
+  }
+
+  /** The integration relays the voice itself (G.722 doorbells): WebRTC only receives. */
+  _relayMode() {
+    return this._call.talkVia === "relay";
   }
 
   /** Talk-back: forced by the config, else the call sensor, else HA's camera capabilities. */
@@ -1438,9 +1804,11 @@ class AjaxDoorbellCard extends HTMLElement {
       this._pc = pc;
       const talk = this._canTalk();
       // Audio first, then video, like Home Assistant's own player. With talk-back
-      // the audio transceiver is sendrecv but carries no track yet: answering
-      // swaps the microphone in with replaceTrack, without renegotiating.
-      this._audioTx = pc.addTransceiver("audio", { direction: talk ? "sendrecv" : "recvonly" });
+      // through go2rtc the audio transceiver is sendrecv but carries no track yet:
+      // answering swaps the microphone in with replaceTrack, without renegotiating.
+      // With the integration's relay, the voice goes another way: receive only.
+      const sendAudio = talk && !this._relayMode();
+      this._audioTx = pc.addTransceiver("audio", { direction: sendAudio ? "sendrecv" : "recvonly" });
       pc.addTransceiver("video", { direction: "recvonly" });
       if (clientConfig && clientConfig.dataChannel) pc.createDataChannel(clientConfig.dataChannel);
       this._remoteStream = new MediaStream();
@@ -1862,6 +2230,7 @@ class AjaxDoorbellCard extends HTMLElement {
     }
     this._micBusy = false;
     this._micTrack = track;
+    if (this._relayMode()) this._startRelay(track);
     track.onended = () => {
       // Unplugged, or the permission was revoked.
       if (this._micTrack !== track) return;
@@ -1878,8 +2247,13 @@ class AjaxDoorbellCard extends HTMLElement {
   _syncMic() {
     const wanted = this._config && this._config.push_to_talk ? this._pttDown : this._micWanted;
     const live = this._mode === "talk" && Boolean(this._micTrack) && wanted;
-    this._setSenderTrack(live ? this._micTrack : null);
-    this._micLive = live && Boolean(this._audioTx);
+    if (this._relay) {
+      this._relay.setLive(live);
+      this._micLive = live && this._relay.ready;
+    } else {
+      this._setSenderTrack(live ? this._micTrack : null);
+      this._micLive = live && Boolean(this._audioTx) && !this._relayMode();
+    }
     this._updateMeter(live);
   }
 
@@ -1894,12 +2268,49 @@ class AjaxDoorbellCard extends HTMLElement {
     sender.replaceTrack(track).catch((err) => debug("replaceTrack failed:", (err && err.message) || err));
   }
 
+  /** Open the integration's relay for this microphone; the mic is live once it is ready. */
+  async _startRelay(track) {
+    if (this._relay) return;
+    const label = this._myLabel || this._label();
+    const relay = new TalkRelay(this._hass, this._config.camera, label, (reason) => {
+      if (this._relay !== relay) return;
+      this._relay = null;
+      this._micWanted = false;
+      this._releaseMic();
+      this._micError = reason === "taken_over" ? "taken_over" : "relay_ended";
+      this._render();
+    });
+    this._relay = relay;
+    try {
+      await relay.start(track);
+    } catch (err) {
+      if (this._relay !== relay) return;
+      this._relay = null;
+      relay.stop();
+      const message = (err && (err.message || err.code)) || String(err);
+      debug("talk relay failed:", message);
+      this._releaseMic();
+      this._micError = `relay:${message}`;
+      this._render();
+      return;
+    }
+    if (this._relay !== relay) return;
+    debug("talk relay ready:", relay.codec);
+    this._syncMic();
+    this._render();
+  }
+
   /** Detach and stop the microphone track so the browser releases the mic. */
   _releaseMic() {
     this._micReq += 1;
     this._micBusy = false;
     const track = this._micTrack;
     this._micTrack = null;
+    if (this._relay) {
+      const relay = this._relay;
+      this._relay = null;
+      relay.stop();
+    }
     this._setSenderTrack(null);
     if (track) {
       track.onended = null;
@@ -2695,6 +3106,11 @@ class AjaxDoorbellCard extends HTMLElement {
   _micErrorText() {
     const name = this._micError;
     if (name === "insecure") return this._t("mic_insecure");
+    if (name === "taken_over") return this._t("mic_taken");
+    if (name === "relay_ended") return this._t("mic_ended");
+    if (typeof name === "string" && name.startsWith("relay:")) {
+      return this._t("mic_relay", { message: name.slice(6) });
+    }
     if (name === "unsupported") return this._t("mic_unsupported");
     if (name === "NotAllowedError" || name === "SecurityError" || name === "PermissionDeniedError") {
       return this._t("mic_denied");

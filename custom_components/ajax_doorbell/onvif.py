@@ -9,6 +9,7 @@ answers 401 the client switches to HTTP Digest as well and keeps it.
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -52,6 +53,7 @@ TOPIC_PREFIXES = {
     "http://www.onvif.org/ver10/topics": "tns1",
     "http://ajax.systems/onvif/topics": "tnsajax",
 }
+TOPIC_DIALECT = "http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet"
 
 ACTION_PULL = "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest"
 ACTION_SYNC = (
@@ -545,12 +547,26 @@ class AjaxOnvifClient:
         )
         return parse_topics(root)
 
-    async def async_create_pullpoint(self, seconds: int) -> PullPoint:
-        """Create a PullPoint subscription that lives for this many seconds."""
+    async def async_create_pullpoint(self, seconds: int, topics: Sequence[str] = ()) -> PullPoint:
+        """Create a PullPoint subscription that lives for this many seconds.
+
+        With topics (as parse_topics spells them), the device only queues those.
+        """
+        expression = ""
+        if topics:
+            namespaces = " ".join(
+                f'xmlns:{prefix}="{namespace}"' for namespace, prefix in TOPIC_PREFIXES.items()
+            )
+            expression = (
+                f'<Filter><wsnt:TopicExpression xmlns:wsnt="{NS_WSNT}" {namespaces} '
+                f'Dialect="{TOPIC_DIALECT}">{escape("|".join(topics))}'
+                "</wsnt:TopicExpression></Filter>"
+            )
         root = await self._call(
             self.service_url("events"),
-            f'<CreatePullPointSubscription xmlns="{NS_EVENTS}"><InitialTerminationTime>'
-            f"PT{seconds}S</InitialTerminationTime></CreatePullPointSubscription>",
+            f'<CreatePullPointSubscription xmlns="{NS_EVENTS}">{expression}'
+            f"<InitialTerminationTime>PT{seconds}S</InitialTerminationTime>"
+            "</CreatePullPointSubscription>",
         )
         reference = find(root, "SubscriptionReference")
         address = find_text(reference, "Address")

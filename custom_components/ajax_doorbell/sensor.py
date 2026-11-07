@@ -56,6 +56,11 @@ class CallStateSensor(_CallSensor, SensorEntity):
     _attr_options = [state.value for state in CallState]
     _attr_translation_key = "call_state"
 
+    async def async_added_to_hass(self) -> None:
+        """Also follow the talk-back capability, learnt late if the DoorBell was busy."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self._doorbell.async_add_capability_listener(self._update))
+
     @property
     def native_value(self) -> str:
         """Return the call state."""
@@ -69,7 +74,9 @@ class CallStateSensor(_CallSensor, SensorEntity):
             "ring_started": call.ring_started,
             "answered_by": call.answered_by,
             "answered_at": call.answered_at,
-            "two_way_audio": self._doorbell.two_way_audio,
+            # The card talks through the integration's relay; see talk.py.
+            "two_way_audio": self._doorbell.talk_codec is not None,
+            "talk_via": "relay" if self._doorbell.talk_codec else None,
         }
 
 

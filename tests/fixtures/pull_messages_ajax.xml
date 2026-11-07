@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- What an Ajax DoorBell sends while someone rings: its own topics carry no
+     PropertyOperation and are repeated every few seconds; ObjectDetector is
+     live tracking (boxes) without ClassTypes. -->
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:ajax="http://ajax.systems/onvif/wsdl">
+<SOAP-ENV:Body><tev:PullMessagesResponse><tev:CurrentTime>2026-11-07T11:22:02Z</tev:CurrentTime><tev:TerminationTime>2026-11-07T11:25:00Z</tev:TerminationTime>
+<wsnt:NotificationMessage><wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/ObjectDetection/Object</wsnt:Topic>
+<wsnt:Message><tt:Message UtcTime="2026-11-07T11:22:00.900Z" PropertyOperation="Changed"><tt:Source><tt:SimpleItem Name="VideoSourceToken" Value="vs-0"/><tt:SimpleItem Name="Rule" Value="vs-0-rule1"/></tt:Source><tt:Data><tt:SimpleItem Name="ClassTypes" Value="Human"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>
+<wsnt:NotificationMessage><wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/tnsajax:PirMotionDetector/Detection</wsnt:Topic>
+<wsnt:Message><tt:Message UtcTime="2026-11-07T11:22:01.284Z"><tt:Source><tt:SimpleItem Name="VideoSourceToken" Value="vs-0"/><tt:SimpleItem Name="Rule" Value="vs-0-rule4"/></tt:Source><tt:Data><tt:SimpleItem Name="Detected" Value="true"/><tt:ElementItem Name="RawPirData"><ajax:RawPirData>DQrp/9P/uv+p</ajax:RawPirData></tt:ElementItem></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>
+<wsnt:NotificationMessage><wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/tnsajax:MotionDetector/Detection</wsnt:Topic>
+<wsnt:Message><tt:Message UtcTime="2026-11-07T11:22:01.325Z"><tt:Source><tt:SimpleItem Name="VideoSourceToken" Value="vs-0"/><tt:SimpleItem Name="Rule" Value="vs-0-rule2"/></tt:Source><tt:Data><tt:SimpleItem Name="Detected" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>
+<wsnt:NotificationMessage><wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/tnsajax:ObjectDetector/Detection</wsnt:Topic>
+<wsnt:Message><tt:Message UtcTime="2026-11-07T11:22:01.700Z"><tt:Source><tt:SimpleItem Name="VideoSourceToken" Value="vs-0"/><tt:SimpleItem Name="Rule" Value="vs-0-rule3"/></tt:Source><tt:Data><tt:ElementItem Name="Objects"><ajax:Objects><ajax:Object bbox="0.48 0.5 0.33 0.49" class="person" confidence="83" trackId="159" trackPoints="" trackDuration="3081" ruleTrigger="0"/></ajax:Objects></tt:ElementItem></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>
+<wsnt:NotificationMessage><wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/tnsajax:RingDetector/Detection</wsnt:Topic>
+<wsnt:Message><tt:Message UtcTime="2026-11-07T11:22:01.756Z"><tt:Source><tt:SimpleItem Name="VideoSourceToken" Value="vs-0"/><tt:SimpleItem Name="Rule" Value="vs-0-rule5"/></tt:Source><tt:Data><tt:SimpleItem Name="Detected" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>
+<wsnt:NotificationMessage><wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/tnsajax:PirMotionDetector/Detection</wsnt:Topic>
+<wsnt:Message><tt:Message UtcTime="2026-11-07T11:22:01.900Z"><tt:Source><tt:SimpleItem Name="VideoSourceToken" Value="vs-0"/><tt:SimpleItem Name="Rule" Value="vs-0-rule4"/></tt:Source><tt:Data><tt:SimpleItem Name="Detected" Value="false"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>
+<wsnt:NotificationMessage><wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/tnsajax:RingDetector/Detection</wsnt:Topic>
+<wsnt:Message><tt:Message UtcTime="2026-11-07T11:22:02.100Z"><tt:Source><tt:SimpleItem Name="VideoSourceToken" Value="vs-0"/><tt:SimpleItem Name="Rule" Value="vs-0-rule5"/></tt:Source><tt:Data><tt:SimpleItem Name="Detected" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>
+</tev:PullMessagesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>

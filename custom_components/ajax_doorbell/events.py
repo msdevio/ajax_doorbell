@@ -31,6 +31,9 @@ RESYNC_DELAY = 1
 # A device that keeps refusing is retried this slowly: it may recover by itself
 # (reboot), and hammering it with a wrong password helps nobody.
 REFUSED_DELAY = 300
+# The DoorBell repeats its states every few seconds, so a filtered subscription
+# that stays silent this long filters too much: it is dropped for a plain one.
+FILTER_SILENCE = 60
 
 
 class EventStream:
@@ -56,6 +59,10 @@ class EventStream:
         self._backoff = 1
         self._refusals = 0
         self._refusal_reported = False
+        # Topics to subscribe to; empty, or once the device mishandles the filter, all of them.
+        self.topics: list[str] = []
+        self.filtered = False
+        self._filter_failed = False
         self.connected = False
         self.last_error: str | None = None
 
@@ -99,8 +106,8 @@ class EventStream:
     async def _run(self) -> None:
         while True:
             try:
-                await self._subscribe_and_pull()
-                delay = 1  # renew refused: a fresh subscription right away
+                # A fresh subscription: at once without the filter, else soon
+                delay = 0 if await self._subscribe_and_pull() else 1
             except OnvifAuthError as err:
                 self.last_error = str(err)
                 self._set_connected(False)
@@ -137,28 +144,53 @@ class EventStream:
                 delay = MAX_BACKOFF
             await asyncio.sleep(delay)
 
-    async def _subscribe_and_pull(self) -> None:
+    async def _subscribe(self) -> PullPoint:
+        """Subscribe to the wanted topics, or to everything if the filter is refused."""
+        self.filtered = bool(self.topics) and not self._filter_failed
+        if self.filtered:
+            try:
+                return await self._client.async_create_pullpoint(SUBSCRIPTION_SECONDS, self.topics)
+            except (OnvifAuthError, OnvifConnectionError):
+                raise
+            except OnvifError as err:
+                _LOGGER.debug("%s refuses the topic filter: %s", self._client.host, err)
+                self._filter_failed = True
+                self.filtered = False
+        return await self._client.async_create_pullpoint(SUBSCRIPTION_SECONDS)
+
+    async def _subscribe_and_pull(self) -> bool:
         pullpoint: PullPoint | None = None
         try:
-            pullpoint = await self._client.async_create_pullpoint(SUBSCRIPTION_SECONDS)
+            pullpoint = await self._subscribe()
             with suppress(OnvifError):
                 await self._client.async_set_synchronization_point(pullpoint)
-            await self._pull_until_broken(pullpoint)
+            return await self._pull_until_broken(pullpoint)
         finally:
             if pullpoint is not None:
                 with suppress(OnvifError, TimeoutError):
                     async with asyncio.timeout(5):
                         await self._client.async_unsubscribe(pullpoint)
 
-    async def _pull_until_broken(self, pullpoint: PullPoint) -> None:
+    async def _pull_until_broken(self, pullpoint: PullPoint) -> bool:
+        """Pull until the subscription ends; True when the filter was just dropped."""
         loop = asyncio.get_running_loop()
         renew_at = loop.time() + SUBSCRIPTION_SECONDS / 2
+        silent_until = loop.time() + FILTER_SILENCE if self.filtered else None
         first = True
         while True:
             events = await self._client.async_pull(pullpoint, PULL_WAIT)
             if first:
                 first = False
                 self._healthy()
+            if silent_until is not None:
+                if events:
+                    silent_until = None
+                elif loop.time() >= silent_until:
+                    _LOGGER.debug(
+                        "%s: nothing through the topic filter, dropping it", self._client.host
+                    )
+                    self._filter_failed = True
+                    return True
             for event in events:
                 try:
                     self._on_event(event)
@@ -171,5 +203,5 @@ class EventStream:
                     raise
                 except OnvifError as err:
                     _LOGGER.debug("Renew refused (%s), creating a new subscription", err)
-                    return
+                    return False
                 renew_at = loop.time() + SUBSCRIPTION_SECONDS / 2

@@ -38,4 +38,4 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - run: node --check card/ajax-doorbell-card.js
+      - run: node --check custom_components/ajax_doorbell/frontend/ajax-doorbell-card.js

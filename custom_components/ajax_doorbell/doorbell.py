@@ -20,7 +20,7 @@ from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, Device
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
-from .call import CallManager
+from .call import CallManager, CallState
 from .const import (
     CONF_CALL_TIMEOUT,
     CONF_RING_DURATION,
@@ -34,7 +34,9 @@ from .const import (
     TALK_CODECS,
     TOPIC_MOTION,
     TOPIC_OBJECT,
+    TOPIC_PIR,
     TOPIC_RING,
+    TOPIC_TRACKING,
 )
 from .events import EventStream
 from .onvif import (
@@ -47,6 +49,7 @@ from .onvif import (
     host_port,
 )
 from .rtsp import RtspError, SdpMedia, StreamDescription, async_describe
+from .talk import TALK_ENCODINGS, TalkSession
 
 if TYPE_CHECKING:
     from homeassistant.components.camera import Camera
@@ -54,10 +57,11 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-DETECTIONS = ("motion", "person", "vehicle", "pet")
-# Motion is a true/false property the device clears itself; AI detections are
-# not always cleared, so they turn off after DETECTION_HOLD seconds.
+DETECTIONS = ("motion", "pir", "person", "vehicle", "pet")
+# AI detections turn off by themselves after DETECTION_HOLD seconds should the
+# device's "clear" ever be lost; motion and PIR are repeated every few seconds.
 HELD_DETECTIONS = frozenset({"person", "vehicle", "pet"})
+USED_TOPICS = TOPIC_RING + TOPIC_PIR + TOPIC_MOTION + TOPIC_OBJECT
 _PREFIX = re.compile(r"(^|/)[\w.-]+:")
 _OBJECT_CLASSES = {
     "human": "person",
@@ -82,7 +86,11 @@ def normalize_topic(topic: str) -> str:
 
 def _matches(topic: str, patterns: tuple[str, ...]) -> bool:
     plain = normalize_topic(topic)
-    return any(pattern in plain for pattern in patterns)
+    return any(plain == pattern or plain.endswith(f"/{pattern}") for pattern in patterns)
+
+
+def _value(data: dict[str, str], *names: str) -> str | None:
+    return next((data[name] for name in names if name in data), None)
 
 
 def _is_true(value: str | None) -> bool:
@@ -97,13 +105,14 @@ def model_name(identity: DeviceIdentity | None, is_doorbell: bool) -> str:
 
 
 class Detections:
-    """Motion and AI detections, each with a safety auto-off."""
+    """Motion, PIR and AI detections, each on while any rule reporting it says so."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize everything as off."""
         self._hass = hass
         self.state: dict[str, bool] = dict.fromkeys(DETECTIONS, False)
-        self._timers: dict[str, CALLBACK_TYPE] = {}
+        self._active: dict[str, set[str]] = {key: set() for key in DETECTIONS}
+        self._timers: dict[tuple[str, str], CALLBACK_TYPE] = {}
         self._listeners: list[Callable[[], None]] = []
 
     @callback
@@ -113,20 +122,27 @@ class Detections:
         return lambda: self._listeners.remove(listener)
 
     @callback
-    def set(self, key: str, value: bool) -> None:
-        """Record a detection; an AI 'on' that never clears turns off by itself."""
-        if (cancel := self._timers.pop(key, None)) is not None:
+    def set(self, key: str, value: bool, source: str = "") -> None:
+        """Record what one source (topic and rule) says about a detection."""
+        if (cancel := self._timers.pop((key, source), None)) is not None:
             cancel()
-        if value and key in HELD_DETECTIONS:
+        active = self._active[key]
+        if value:
+            active.add(source)
+            if key in HELD_DETECTIONS:
 
-            @callback
-            def _hold_expired(_now: datetime) -> None:
-                self._timers.pop(key, None)
-                self.set(key, False)
+                @callback
+                def _hold_expired(_now: datetime) -> None:
+                    self._timers.pop((key, source), None)
+                    self.set(key, False, source)
 
-            self._timers[key] = async_call_later(self._hass, DETECTION_HOLD, _hold_expired)
-        if self.state.get(key) != value:
-            self.state[key] = value
+                self._timers[key, source] = async_call_later(
+                    self._hass, DETECTION_HOLD, _hold_expired
+                )
+        else:
+            active.discard(source)
+        if self.state[key] != bool(active):
+            self.state[key] = bool(active)
             for listener in list(self._listeners):
                 listener()
 
@@ -164,6 +180,9 @@ class AjaxDoorbell:
         self.description: StreamDescription | None = None
         self.backchannel: SdpMedia | None = None
         self.last_events: deque[dict[str, Any]] = deque(maxlen=25)
+        self._last_values: dict[str, tuple[tuple[str, str], ...]] = {}
+        self._unhandled: set[str] = set()
+        self._ring_held: dict[str, bool] = {}
         self._last_ring = 0.0
         self.call = CallManager(
             hass,
@@ -184,6 +203,10 @@ class AjaxDoorbell:
         self._connection_listeners: list[Callable[[], None]] = []
         self._capability_listeners: list[Callable[[], None]] = []
         self._reprobe: asyncio.Task | None = None
+        self.talk: TalkSession | None = None
+        self._talk_lock = asyncio.Lock()
+        self._call_state = self.call.state
+        self.call.async_add_listener(self._call_changed)
 
     # ------------------------------------------------------------------ setup
 
@@ -215,6 +238,7 @@ class AjaxDoorbell:
             self.topics = await client.async_get_topics()
         except OnvifError as err:
             _LOGGER.debug("GetEventProperties failed: %s", err)
+        self.events.topics = self.subscription_topics
         await self.async_probe_backchannel()
 
     async def async_probe_backchannel(self) -> None:
@@ -250,6 +274,8 @@ class AjaxDoorbell:
         if self._reprobe is not None:
             self._reprobe.cancel()
         await self.events.async_stop()
+        if self.talk is not None:
+            await self.async_stop_talk(self.talk, "unloaded")
         self.call.shutdown()
         self.detections.shutdown()
 
@@ -273,9 +299,36 @@ class AjaxDoorbell:
         return not self.topics or any(_matches(t, TOPIC_OBJECT) for t in self.topics)
 
     @property
+    def has_pir(self) -> bool:
+        """Return True when the device has a PIR sensor (or we cannot tell)."""
+        return not self.topics or any(_matches(t, TOPIC_PIR) for t in self.topics)
+
+    @property
+    def subscription_topics(self) -> list[str]:
+        """Return the advertised topics the integration uses, to filter the subscription.
+
+        The tracking topic is left out when the standard object topic exists:
+        it only repeats the same detections, as boxes, several times a second.
+        """
+        standard_objects = any(_matches(t, TOPIC_OBJECT[:1]) for t in self.topics)
+        return [
+            topic
+            for topic in self.topics
+            if _matches(topic, USED_TOPICS)
+            and not (standard_objects and _matches(topic, TOPIC_TRACKING))
+        ]
+
+    @property
     def two_way_audio(self) -> bool:
-        """Return True when go2rtc can feed the backchannel without transcoding."""
+        """Return True when go2rtc itself can feed the backchannel (Home Assistant's Talk)."""
         return bool(self.backchannel and self.backchannel.codec_names & TALK_CODECS)
+
+    @property
+    def talk_codec(self) -> str | None:
+        """Return the backchannel codec the card can encode for the relay, if any."""
+        if self.backchannel is None:
+            return None
+        return next((c for c in TALK_ENCODINGS if c in self.backchannel.codec_names), None)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -326,6 +379,43 @@ class AjaxDoorbell:
             except Exception as err:
                 _LOGGER.debug("go2rtc could not grab a frame: %s", err)
         return None
+
+    # ------------------------------------------------------------------- talk
+
+    async def async_start_talk(self, owner: str) -> TalkSession:
+        """Open the speaker for one talker, taking it from any other."""
+        if self.main_profile is None:
+            raise RtspError(f"{self.client.host}: no stream")
+        async with self._talk_lock:
+            if (previous := self.talk) is not None:
+                self.talk = None
+                await previous.async_close("taken_over")
+            data = self.entry.data
+            session = TalkSession(
+                self.stream_url(self.main_profile, with_credentials=False),
+                data[CONF_USERNAME],
+                data[CONF_PASSWORD],
+                owner,
+            )
+            await session.async_open()
+            self.talk = session
+        _LOGGER.debug("%s: %s talks to the visitor", self.entry.title, owner)
+        return session
+
+    async def async_stop_talk(self, session: TalkSession, reason: str = "closed") -> None:
+        """Close one talker's session."""
+        if self.talk is session:
+            self.talk = None
+        await session.async_close(reason)
+
+    @callback
+    def _call_changed(self) -> None:
+        previous, self._call_state = self._call_state, self.call.state
+        if self._call_state is CallState.IDLE and previous is not CallState.IDLE and self.talk:
+            # Hung up (or timed out) from any screen: the speaker closes too.
+            self.entry.async_create_background_task(
+                self.hass, self.async_stop_talk(self.talk, "hung_up"), "ajax_doorbell hang up"
+            )
 
     # ----------------------------------------------------------------- events
 
@@ -405,43 +495,50 @@ class AjaxDoorbell:
 
     @callback
     def _on_event(self, event: OnvifEvent) -> None:
-        self.last_events.append(
-            {
-                "received": dt_util.utcnow().isoformat(),
-                "sent": event.utc_time.isoformat() if event.utc_time else None,
-                "topic": event.topic,
-                "operation": event.operation,
-                "data": event.data,
-            }
-        )
-        topic = event.topic
-        if _matches(topic, TOPIC_RING):
-            self._handle_ring(event)
-        elif _matches(topic, TOPIC_MOTION):
-            state = next(
-                (event.data[k] for k in ("State", "IsMotion", "Detected") if k in event.data),
-                None,
+        topic = normalize_topic(event.topic)
+        data = event.data
+        if _matches(topic, TOPIC_TRACKING) and _value(data, "ClassTypes", "ClassType") is None:
+            return  # live object tracking: boxes, several times a second
+        # One source per topic and rule: the DoorBell repeats each one's state.
+        source = "|".join((topic, *(f"{k}={v}" for k, v in sorted(event.source.items()))))
+        values = tuple(sorted(data.items()))
+        if self._last_values.get(source) != values:
+            self._last_values[source] = values
+            self.last_events.append(
+                {
+                    "received": dt_util.utcnow().isoformat(),
+                    "sent": event.utc_time.isoformat() if event.utc_time else None,
+                    "topic": event.topic,
+                    "operation": event.operation,
+                    "data": data,
+                }
             )
-            self.detections.set("motion", _is_true(state))
+        if _matches(topic, TOPIC_RING):
+            self._handle_ring(event, source)
+        elif _matches(topic, TOPIC_PIR):
+            self.detections.set("pir", _is_true(_value(data, "Detected", "State")), source)
+        elif _matches(topic, TOPIC_MOTION):
+            state = _value(data, "State", "IsMotion", "Detected")
+            self.detections.set("motion", _is_true(state), source)
         elif _matches(topic, TOPIC_OBJECT):
-            raw = event.data.get("ClassTypes", event.data.get("ClassType", ""))
+            raw = _value(data, "ClassTypes", "ClassType") or ""
             found = {_OBJECT_CLASSES.get(c.strip().lower()) for c in raw.split(",")}
             for key in ("person", "vehicle", "pet"):
-                self.detections.set(key, key in found)
-        else:
-            _LOGGER.debug("Unhandled event %s %s", topic, event.data)
+                self.detections.set(key, key in found, source)
+        elif topic not in self._unhandled:
+            self._unhandled.add(topic)
+            _LOGGER.debug("Unhandled event topic %s: %s", event.topic, data)
 
     @callback
-    def _handle_ring(self, event: OnvifEvent) -> None:
-        pressed = _is_true(
-            next(
-                (event.data[k] for k in ("Detected", "State", "Value") if k in event.data),
-                "true",  # a ring message without a value is a press
-            )
-        )
-        # The synchronization point replays the current value on every
-        # (re)subscription; only real changes are presses.
-        if not pressed or event.operation == "Initialized":
+    def _handle_ring(self, event: OnvifEvent, source: str) -> None:
+        value = _value(event.data, "Detected", "State", "Value")
+        pressed = value is None or _is_true(value)  # a ring without a value is a press
+        held = self._ring_held.get(source, False)
+        if value is not None:
+            self._ring_held[source] = pressed
+        # The DoorBell repeats its state every few seconds and the synchronization
+        # point replays it: only a change to "pressed" is a new press.
+        if not pressed or held or event.operation == "Initialized":
             return
         now = time.monotonic()
         if now - self._last_ring < RING_DEBOUNCE:

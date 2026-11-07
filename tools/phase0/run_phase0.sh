@@ -20,14 +20,20 @@ echo
 
 EXTRA=()
 if [[ " $* " != *" --nvr "* ]]; then
-  read -rp "Jouer un bip d'1 s dans le haut-parleur de la sonnette pour tester le micro ? [o/N] " BEEP
+  read -rp "Jouer des bips dans le haut-parleur de la sonnette pour tester le micro ? [o/N] " BEEP
   [[ "${BEEP,,}" == o* ]] && EXTRA+=(--beep)
-  echo "Pendant l'écoute des événements (90 s, annoncée à l'écran), appuie sur la sonnette."
+  echo
+  echo "Déroulé : environ 20 s de tests automatiques, puis l'écran affiche"
+  echo "« APPUIE SUR LA SONNETTE MAINTENANT ». Tu as alors 3 min pour aller sonner."
+  echo "Ne décroche pas dans l'app Ajax."
+  [[ " ${EXTRA[*]-} " == *" --beep "* ]] &&
+    echo "Après l'appui, reste devant la porte : 5 à 10 s plus tard, la sonnette doit jouer 3 bips courts et aigus, puis 2 bips longs et graves."
+  echo
 fi
 
 status=0
 AJAX_ONVIF_USER="$ONVIF_USER" AJAX_ONVIF_PASS="$ONVIF_PASS" \
-  python3 -I "$HERE/probe_onvif.py" --report "$REPORT" "${EXTRA[@]}" "$@" || status=$?
+  python3 -I "$HERE/probe_onvif.py" --report "$REPORT" ${EXTRA[@]+"${EXTRA[@]}"} "$@" || status=$?
 
 unset ONVIF_PASS ONVIF_USER
 exit "$status"

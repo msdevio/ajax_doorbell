@@ -54,9 +54,13 @@ async def async_get_config_entry_diagnostics(
             "medias": [asdict(media) for media in description.medias] if description else [],
         },
         "two_way_audio": doorbell.two_way_audio,
+        "talk_codec": doorbell.talk_codec,
+        "talk": doorbell.talk.as_dict() if doorbell.talk else None,
         "topics": doorbell.topics,
         "event_stream": {
             "connected": doorbell.events.connected,
+            "filtered": doorbell.events.filtered,
+            "topics": doorbell.events.topics,
             "last_error": doorbell.events.last_error,
         },
         "call": {

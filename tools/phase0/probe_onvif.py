@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Phase 0 probe for an Ajax DoorBell (or Ajax NVR) on the local network.
 
-Read-only, except with --beep, which plays a one-second 1 kHz tone through the
-doorbell speaker to prove the talk-back path.
+Read-only, except with --beep, which plays short beeps through the doorbell
+speaker to prove the talk-back path (G.722, G.711 A-law or mu-law).
 
 It uses only the Python standard library and talks to the device directly with
 the ONVIF account created in the Ajax app (Device > Settings > Service >
@@ -32,6 +32,7 @@ import secrets
 import socket
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -429,7 +430,115 @@ def tone(encoder, seconds: float, rate: int = 8000, freq: float = 1000.0) -> byt
     return bytes(encoder(int(9000 * math.sin(2 * math.pi * freq * i / rate))) for i in range(count))
 
 
+# ITU-T G.722 at 64 kbit/s (the DoorBell's only backchannel codec). Bit-exact
+# with FFmpeg's encoder; 16 kHz 16-bit samples in, one byte per two samples out.
+_QMF = (3, -11, 12, 32, -210, 951, 3876, -805, 362, -156, 53, -11)
+_Q6 = (0, 35, 72, 110, 150, 190, 233, 276, 323, 370, 422, 473, 530, 587, 650, 714, 786, 858,
+       940, 1023, 1121, 1219, 1339, 1458, 1612, 1765, 1980, 2195, 2557, 2919, 0, 0)  # fmt: skip
+_ILN = (0, 63, 62, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13,
+        12, 11, 10, 9, 8, 7, 6, 5, 4, 0)  # fmt: skip
+_ILP = (0, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43, 42, 41,
+        40, 39, 38, 37, 36, 35, 34, 33, 32, 0)  # fmt: skip
+_WL = (-60, -30, 58, 172, 334, 538, 1198, 3042)
+_RL42 = (0, 7, 6, 5, 4, 3, 2, 1, 7, 6, 5, 4, 3, 2, 1, 0)
+_ILB = (2048, 2093, 2139, 2186, 2233, 2282, 2332, 2383, 2435, 2489, 2543, 2599, 2656, 2714,
+        2774, 2834, 2896, 2960, 3025, 3091, 3158, 3228, 3298, 3371, 3444, 3520, 3597, 3676,
+        3756, 3838, 3922, 4008)  # fmt: skip
+_QM4 = (0, -20456, -12896, -8968, -6288, -4240, -2584, -1200, 20456, 12896, 8968, 6288, 4240,
+        2584, 1200, 0)  # fmt: skip
+_QM2 = (-7408, -1616, 7408, 1616)
+_IHN, _IHP, _WH, _RH2 = (0, 1, 0), (0, 3, 2), (0, -214, 798), (2, 1, 2, 1)
+
+
+def _sat(value: int) -> int:
+    return 32767 if value > 32767 else -32768 if value < -32768 else value
+
+
+class _Band:
+    def __init__(self, det: int) -> None:
+        self.s = self.sp = self.sz = self.nb = 0
+        self.det = det
+        self.r, self.a, self.ap, self.p = [0] * 3, [0] * 3, [0] * 3, [0] * 3
+        self.d, self.b, self.bp = [0] * 7, [0] * 7, [0] * 7
+
+    def update(self, d: int) -> None:
+        """Block 4: reconstruct, adapt the pole and zero predictors, predict."""
+        r, a, ap, p, dd, b, bp = self.r, self.a, self.ap, self.p, self.d, self.b, self.bp
+        dd[0] = d
+        r[0] = _sat(self.s + d)
+        p[0] = _sat(self.sz + d)
+        sg0, sg1, sg2 = p[0] >> 15, p[1] >> 15, p[2] >> 15
+        wd1 = _sat(a[1] << 2)
+        wd2 = min(-wd1 if sg0 == sg1 else wd1, 32767)
+        wd3 = (wd2 >> 7) + (128 if sg0 == sg2 else -128) + ((a[2] * 32512) >> 15)
+        ap[2] = max(-12288, min(12288, wd3))
+        ap[1] = _sat((192 if sg0 == sg1 else -192) + ((a[1] * 32640) >> 15))
+        limit = _sat(15360 - ap[2])
+        ap[1] = max(-limit, min(limit, ap[1]))
+        step = 0 if d == 0 else 128
+        sgd = d >> 15
+        for i in range(1, 7):
+            bp[i] = _sat((step if (dd[i] >> 15) == sgd else -step) + ((b[i] * 32640) >> 15))
+        for i in range(6, 0, -1):
+            dd[i] = dd[i - 1]
+            b[i] = bp[i]
+        for i in (2, 1):
+            r[i], p[i], a[i] = r[i - 1], p[i - 1], ap[i]
+        self.sp = _sat(((a[1] * _sat(r[1] + r[1])) >> 15) + ((a[2] * _sat(r[2] + r[2])) >> 15))
+        self.sz = _sat(sum((b[i] * _sat(dd[i] + dd[i])) >> 15 for i in range(6, 0, -1)))
+        self.s = _sat(self.sp + self.sz)
+
+
+class G722Encoder:
+    def __init__(self) -> None:
+        self._x = [0] * 24
+        self._low, self._high = _Band(32), _Band(8)
+
+    def encode(self, samples: list[int]) -> bytes:
+        out = bytearray()
+        x, low, high = self._x, self._low, self._high
+        for j in range(0, len(samples) - 1, 2):
+            del x[:2]
+            x += (samples[j], samples[j + 1])
+            sumodd = sum(x[2 * i] * _QMF[i] for i in range(12))
+            sumeven = sum(x[2 * i + 1] * _QMF[11 - i] for i in range(12))
+            xlow, xhigh = (sumeven + sumodd) >> 14, (sumeven - sumodd) >> 14
+
+            el = _sat(xlow - low.s)
+            wd = el if el >= 0 else -(el + 1)
+            i = 1
+            while i < 30 and wd >= (_Q6[i] * low.det) >> 12:
+                i += 1
+            ilow = _ILN[i] if el < 0 else _ILP[i]
+            ril = ilow >> 2
+            dlow = (low.det * _QM4[ril]) >> 15
+            low.nb = max(0, min(18432, ((low.nb * 127) >> 7) + _WL[_RL42[ril]]))
+            shift, base = 8 - (low.nb >> 11), _ILB[(low.nb >> 6) & 31]
+            low.det = (base << -shift if shift < 0 else base >> shift) << 2
+            low.update(dlow)
+
+            eh = _sat(xhigh - high.s)
+            wd = eh if eh >= 0 else -(eh + 1)
+            ihigh = (_IHN if eh < 0 else _IHP)[2 if wd >= (564 * high.det) >> 12 else 1]
+            dhigh = (high.det * _QM2[ihigh]) >> 15
+            high.nb = max(0, min(22528, ((high.nb * 127) >> 7) + _WH[_RH2[ihigh]]))
+            shift, base = 10 - (high.nb >> 11), _ILB[(high.nb >> 6) & 31]
+            high.det = (base << -shift if shift < 0 else base >> shift) << 2
+            high.update(dhigh)
+
+            out.append((ihigh << 6) | ilow)
+        return bytes(out)
+
+
 # ----------------------------------------------------------------------- report
+
+
+REPORT = io.StringIO()
+
+
+def report_only(line: str) -> None:
+    """Keep a line in the saved report without flooding the screen."""
+    REPORT.write(line + "\n")
 
 
 def section(title: str) -> None:
@@ -449,8 +558,18 @@ class Findings:
     snapshot: str = ""
     audio_codec: str = "?"
     backchannel: str = "not tested"
+    back_control: str = ""
+    clock: str = "?"
+    snapshot_fetch: str = "not tried"
     ring_topic: str = "not found"
     ring_seen: list[str] = field(default_factory=list)
+    audio_clock: int = 0
+    topic_filter: str = "not tried"
+    rates: str = ""
+    rang: bool = False
+    ring_line: str = ""
+    ring_delay: str = "?"
+    pull: str = "?"
     gop: str = "?"
     bitrate: str = "?"
     startup: str = "?"
@@ -462,6 +581,45 @@ class Findings:
 # ------------------------------------------------------------------------ steps
 
 
+def device_utc(root: ET.Element) -> dt.datetime | None:
+    utc = first(root, "UTCDateTime")
+    if utc is None:
+        return None
+    d, t = first(utc, "Date"), first(utc, "Time")
+    return dt.datetime(
+        int(text(d, "Year")),
+        int(text(d, "Month")),
+        int(text(d, "Day")),
+        int(text(t, "Hour")),
+        int(text(t, "Minute")),
+        int(text(t, "Second")),
+        tzinfo=dt.UTC,
+    )
+
+
+def refine_offset(cam: Onvif) -> tuple[float, float] | None:
+    """Clock offset to a few tens of ms, from the moment the device's second ticks.
+
+    GetSystemDateAndTime only has whole seconds, so poll it until the second
+    changes: the tick happened between the two last readings.
+    """
+    body = '<GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl"/>'
+    previous: tuple[dt.datetime, float] | None = None
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        sent = time.time()
+        reading = device_utc(cam.call("device_service", body, auth=False, timeout=3))
+        received = time.time()
+        if reading is None:
+            return None
+        middle = (sent + received) / 2
+        if previous is not None and reading > previous[0]:
+            tick = (previous[1] + middle) / 2
+            return reading.timestamp() - tick, (middle - previous[1]) / 2 + (received - sent) / 2
+        previous = (reading, middle)
+    return None
+
+
 def step_device(cam: Onvif, f: Findings) -> None:
     section("Device")
     root = cam.call(
@@ -469,22 +627,16 @@ def step_device(cam: Onvif, f: Findings) -> None:
         '<GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl"/>',
         auth=False,
     )
-    utc = first(root, "UTCDateTime")
-    if utc is not None:
-        d, t = first(utc, "Date"), first(utc, "Time")
-        device = dt.datetime(
-            int(text(d, "Year")),
-            int(text(d, "Month")),
-            int(text(d, "Day")),
-            int(text(t, "Hour")),
-            int(text(t, "Minute")),
-            int(text(t, "Second")),
-            tzinfo=dt.UTC,
-        )
+    device = device_utc(root)
+    if device is not None:
         cam.offset = (device - dt.datetime.now(dt.UTC)).total_seconds()
         print(
             f"device clock offset: {cam.offset:+.1f} s (type {text(root, 'DateTimeType')}, TZ {text(root, 'TZ')})"
         )
+        if refined := refine_offset(cam):
+            cam.offset, error = refined
+            f.clock = f"device clock {cam.offset * 1000:+.0f} ms from this computer (±{error * 1000:.0f} ms)"
+            print(f.clock)
 
     info = cam.call(
         "device_service", '<GetDeviceInformation xmlns="http://www.onvif.org/ver10/device/wsdl"/>'
@@ -529,6 +681,36 @@ def step_device(cam: Onvif, f: Findings) -> None:
         print(f"GetNetworkInterfaces: {err}")
 
 
+def jpeg_size(data: bytes) -> str:
+    i = 2
+    while i + 9 < len(data) and data[i] == 0xFF:
+        marker, length = data[i + 1], int.from_bytes(data[i + 2 : i + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2):
+            height = int.from_bytes(data[i + 5 : i + 7], "big")
+            return f"{int.from_bytes(data[i + 7 : i + 9], 'big')}x{height}"
+        i += 2 + length
+    return "?x?"
+
+
+def fetch_snapshot(cam: Onvif, uri: str) -> str:
+    """Time one snapshot download. HTTP Digest only: Basic would expose the password."""
+    mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    mgr.add_password(None, uri, cam.user, cam.password)
+    opener = urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(mgr))
+    start = time.monotonic()
+    try:
+        with opener.open(uri, timeout=8) as resp:
+            data = resp.read()
+            ctype = resp.headers.get("Content-Type", "?")
+    except urllib.error.HTTPError as err:
+        scheme = (err.headers.get("WWW-Authenticate") or "no challenge").split(" ", 1)[0]
+        return f"HTTP {err.code} ({scheme})"
+    except (urllib.error.URLError, OSError) as err:
+        return f"network: {err}"
+    took = (time.monotonic() - start) * 1000
+    return f"{ctype} {jpeg_size(data)} {len(data) // 1024} KB in {took:.0f} ms"
+
+
 def step_media(cam: Onvif, f: Findings) -> None:
     section("Media2 profiles")
     tr2 = 'xmlns="http://www.onvif.org/ver20/media/wsdl"'
@@ -552,7 +734,7 @@ def step_media(cam: Onvif, f: Findings) -> None:
                 f"profile {venc.get('Profile', text(venc, 'Profile'))}"
             )
         if aenc is not None:
-            codec = f"{text(aenc, 'Encoding')} {text(aenc, 'SampleRate')} Hz {text(aenc, 'Bitrate')} kbps"
+            codec = f"{text(aenc, 'Encoding')} {text(aenc, 'SampleRate')} kHz {text(aenc, 'Bitrate')} kbps"
             line += f" | audio {codec}"
             f.audio_codec = codec
         if aout is not None:
@@ -576,10 +758,14 @@ def step_media(cam: Onvif, f: Findings) -> None:
                 "media2",
                 f"<GetSnapshotUri {tr2}><ProfileToken>{token}</ProfileToken></GetSnapshotUri>",
             )
-            f.snapshot = text(snap, "Uri")
-            print(f"    snapshot {hide(f.snapshot)}")
+            snapshot = text(snap, "Uri")
+            f.snapshot = f.snapshot or snapshot
+            print(f"    snapshot {hide(snapshot)}")
         except OnvifError as err:
             print(f"    GetSnapshotUri: {err}")
+    if f.snapshot:
+        f.snapshot_fetch = fetch_snapshot(cam, f.snapshot)
+        print(f"snapshot fetch: {f.snapshot_fetch}")
 
     for call in (
         "GetAudioOutputConfigurations",
@@ -630,14 +816,53 @@ def step_topics(cam: Onvif, f: Findings) -> None:
             f.ring_topic = topic
 
 
-def step_events(cam: Onvif, f: Findings, seconds: int) -> None:
-    section(f"Live events for {seconds} s: press the doorbell now")
-    tev = 'xmlns="http://www.onvif.org/ver10/events/wsdl"'
-    sub = cam.call(
-        "events",
-        f"<CreatePullPointSubscription {tev}><InitialTerminationTime>PT{seconds + 60}S</InitialTerminationTime></CreatePullPointSubscription>",
+EVENT_FILTER = "|".join(
+    (
+        "tns1:RuleEngine/tnsajax:RingDetector/Detection",
+        "tns1:RuleEngine/tnsajax:PirMotionDetector/Detection",
+        "tns1:RuleEngine/tnsajax:MotionDetector/Detection",
+        "tns1:RuleEngine/ObjectDetection/Object",
+        "tns1:VideoSource/MotionAlarm",
     )
-    address = text(first(sub, "SubscriptionReference"), "Address")
+)
+
+
+def subscribe(cam: Onvif, f: Findings, seconds: int) -> str:
+    """Subscribe with a topic filter, or without one if the device refuses it."""
+    tev = 'xmlns="http://www.onvif.org/ver10/events/wsdl"'
+    termination = f"<InitialTerminationTime>PT{seconds + 60}S</InitialTerminationTime>"
+    expression = (
+        '<wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" '
+        'xmlns:tns1="http://www.onvif.org/ver10/topics" '
+        'xmlns:tnsajax="http://ajax.systems/onvif/topics" '
+        'Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">'
+        f"{EVENT_FILTER}</wsnt:TopicExpression>"
+    )
+    try:
+        sub = cam.call(
+            "events",
+            f"<CreatePullPointSubscription {tev}><Filter>{expression}</Filter>{termination}"
+            "</CreatePullPointSubscription>",
+        )
+        f.topic_filter = "accepted"
+    except OnvifError as err:
+        f.topic_filter = f"refused ({err})"
+        sub = cam.call(
+            "events",
+            f"<CreatePullPointSubscription {tev}>{termination}</CreatePullPointSubscription>",
+        )
+    print(f"topic filter {f.topic_filter}")
+    return text(first(sub, "SubscriptionReference"), "Address")
+
+
+def is_active(data: dict[str, str]) -> bool:
+    return any(value.lower() in ("true", "1") for value in data.values())
+
+
+def step_events(cam: Onvif, f: Findings, seconds: int, beep: bool) -> None:
+    section(f"Live events, up to {seconds} s")
+    tev = 'xmlns="http://www.onvif.org/ver10/events/wsdl"'
+    address = subscribe(cam, f, seconds)
     print(f"subscription {address}")
     try:
         cam.call(
@@ -647,46 +872,116 @@ def step_events(cam: Onvif, f: Findings, seconds: int) -> None:
         )
     except OnvifError as err:
         print(f"SetSynchronizationPoint: {err}")
-    end = time.monotonic() + seconds
+    print(
+        f"\a\n>>> APPUIE SUR LA SONNETTE MAINTENANT (tu as {seconds // 60} min {seconds % 60:02d} s)"
+        + (", puis reste devant la porte pour entendre les bips." if beep else ".")
+        + "\n"
+    )
+    began = time.monotonic()
+    end = began + seconds
+    reminder = began + 20
+    rang_at: float | None = None
+    shown: set[str] = set()
+    last: dict[tuple[str, str], str] = {}
+    counts: dict[str, int] = {}
+    early, late = 0, 0  # pulls carrying a fresh event, returned before or at their timeout
     try:
-        while time.monotonic() < end:
+        while True:
+            now = time.monotonic()
+            stop = end if rang_at is None else min(end, rang_at + 5)
+            if now >= stop:
+                break
+            if rang_at is None and now >= reminder:
+                left = int(end - now)
+                print(
+                    f">>> Toujours à l'écoute : appuie sur la sonnette ({left // 60} min {left % 60:02d} s restantes)."
+                )
+                reminder += 20
+            wait = max(1, min(5, int(stop - now)))
+            started = time.monotonic()
             try:
                 root = cam.call(
                     address,
-                    f"<PullMessages {tev}><Timeout>PT5S</Timeout><MessageLimit>32</MessageLimit></PullMessages>",
+                    f"<PullMessages {tev}><Timeout>PT{wait}S</Timeout><MessageLimit>32</MessageLimit></PullMessages>",
                     action=ACTION_PULL,
-                    timeout=15,
+                    timeout=wait + 10,
                 )
             except OnvifError as err:
                 print(f"PullMessages: {err}")
                 time.sleep(1)
                 continue
+            took = time.monotonic() - started
             received = dt.datetime.now(dt.UTC)
+            fresh_in_pull = False
             for msg in iter_local(root, "NotificationMessage"):
                 topic_node = first(msg, "Topic")
                 topic = (topic_node.text or "").strip() if topic_node is not None else "?"
+                counts[topic] = counts.get(topic, 0) + 1
                 message = first(first(msg, "Message"), "Message")
                 utc = message.get("UtcTime", "") if message is not None else ""
                 op = message.get("PropertyOperation", "") if message is not None else ""
-                items = []
+                items, data, rule = [], {}, ""
                 for block in ("Source", "Data"):
                     node = first(message, block)
                     if node is None:
                         continue
                     for item in iter_local(node, "SimpleItem"):
                         items.append(f"{block[0]}:{item.get('Name')}={item.get('Value')}")
-                delay = ""
+                        if block == "Data":
+                            data[item.get("Name") or "?"] = item.get("Value") or ""
+                        elif item.get("Name") == "Rule":
+                            rule = item.get("Value") or ""
+                delay_ms = None
                 if utc:
                     try:
                         sent = dt.datetime.fromisoformat(utc.replace("Z", "+00:00"))
-                        delay = f" delay {((received - sent).total_seconds() + cam.offset) * 1000:.0f} ms"
+                        if sent.tzinfo is None:
+                            sent = sent.replace(tzinfo=dt.UTC)
+                        delay_ms = ((received - sent).total_seconds() + cam.offset) * 1000
                     except ValueError:
                         pass
+                fresh = op != "Initialized"
+                fresh_in_pull |= fresh
                 stamp = received.strftime("%H:%M:%S.%f")[:-3]
-                line = f"{stamp} {topic} {op} {' '.join(items)}{delay}"
-                print(line)
+                line = (
+                    f"{stamp} {topic} {op} {' '.join(items)}"
+                    + (f" delay {delay_ms:.0f} ms" if delay_ms is not None else "")
+                    + f" (pull {took * 1000:.0f} ms of {wait} s)"
+                )
+                state = " ".join(f"{k}={v}" for k, v in sorted(data.items()))
+                changed = bool(data) and last.get((topic, rule)) != state
+                last[(topic, rule)] = state
+                if changed:
+                    print(line)
+                else:
+                    report_only(line)
+                if topic not in shown:
+                    shown.add(topic)
+                    report_only(f"    raw {ET.tostring(msg, encoding='unicode')[:1500]}")
                 if "Ring" in topic:
                     f.ring_seen.append(line)
+                    if fresh and is_active(data) and rang_at is None:
+                        rang_at = time.monotonic()
+                        f.rang = True
+                        f.ring_line = line
+                        f.ring_delay = (
+                            f"{delay_ms:.0f} ms from the device timestamp to this computer"
+                            if delay_ms is not None
+                            else "no UtcTime"
+                        ) + f", pull answered after {took * 1000:.0f} ms of {wait} s"
+                        print(
+                            "\a>>> Sonnerie reçue"
+                            + (
+                                " ! Reste devant la porte : des bips dans 5 à 10 s."
+                                if beep
+                                else " !"
+                            )
+                        )
+            if fresh_in_pull:
+                if took < wait - 0.5:
+                    early += 1
+                else:
+                    late += 1
     finally:
         with suppress(OnvifError):
             cam.call(
@@ -694,6 +989,27 @@ def step_events(cam: Onvif, f: Findings, seconds: int) -> None:
                 '<Unsubscribe xmlns="http://docs.oasis-open.org/wsn/b-2"/>',
                 action=ACTION_UNSUB,
             )
+    if early:
+        f.pull = f"answers as soon as an event arrives ({early} early, {late} at timeout)"
+    elif late:
+        f.pull = f"answers only at its timeout ({late} pulls): events wait up to the pull timeout"
+    else:
+        f.pull = "no fresh event to judge"
+    print(f"PullMessages {f.pull}")
+    elapsed = max(time.monotonic() - began, 1)
+    f.rates = ", ".join(
+        f"{'/'.join(part.split(':')[-1] for part in t.split('/')[-2:])} {n / elapsed:.1f}/s"
+        for t, n in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
+    print(f"message rates: {f.rates}")
+    if f.topic_filter == "accepted":
+        tracking = sum(n for t, n in counts.items() if "ObjectDetector" in t)
+        f.topic_filter = (
+            f"accepted but ignored ({tracking} tracking messages still came)"
+            if tracking
+            else "accepted and applied (no tracking flood)"
+        )
+        print(f"topic filter {f.topic_filter}")
 
 
 def describe(host: str, port: int, user: str, password: str, uri: str, backchannel: bool):
@@ -739,13 +1055,16 @@ def step_rtsp(args, f: Findings) -> list[str]:
                 print(
                     f"    m={media.kind} {media.direction} {media.payloads} control={media.control}"
                 )
+            # the backchannel is the track the client sends on, or one the plain SDP lacks
+            known = {m.control for m in plain}
             extra = [
-                m for m in withbc if m.kind == "audio" and m.direction in ("sendonly", "recvonly")
+                m
+                for m in withbc
+                if m.kind == "audio" and (m.direction == "sendonly" or m.control not in known)
             ]
-            if len(withbc) > len(plain) or extra:
-                f.backchannel = "YES: " + "; ".join(
-                    f"{m.direction} {m.payloads}" for m in extra or withbc[len(plain) :]
-                )
+            if extra:
+                f.backchannel = "YES: " + "; ".join(f"{m.direction} {m.payloads}" for m in extra)
+                f.back_control = f.back_control or extra[0].control
             else:
                 f.backchannel = "no extra audio track offered"
         else:
@@ -792,7 +1111,7 @@ def step_stream(args, f: Findings, uri: str) -> None:
         play = rtsp.request("PLAY", base, {"Range": "npt=0.000-"})
         print(f"PLAY -> {play.status}")
         stats: dict[int, dict] = {
-            ch: {"bytes": 0, "packets": 0, "pt": set(), "ts": set()} for ch in channels
+            ch: {"bytes": 0, "packets": 0, "pt": set(), "ts": set(), "seq": []} for ch in channels
         }
         idr_ts: list[int] = []
         first_idr = None
@@ -808,6 +1127,7 @@ def step_stream(args, f: Findings, uri: str) -> None:
             s["packets"] += 1
             s["pt"].add(payload[1] & 0x7F)
             s["ts"].add(int.from_bytes(payload[4:8], "big"))
+            s["seq"].append((int.from_bytes(payload[4:8], "big"), len(payload) - header))
             if channels[channel].kind == "video" and 5 in nal_types(payload[header:]):
                 rtp_ts = int.from_bytes(payload[4:8], "big")
                 if not idr_ts or idr_ts[-1] != rtp_ts:
@@ -824,6 +1144,19 @@ def step_stream(args, f: Findings, uri: str) -> None:
             )
             if media.kind == "video":
                 f.bitrate = f"{kbps:.0f} kbps, {frames:.1f} fps"
+            elif len(s["seq"]) > 3:
+                # G.711 and G.722 at 64 kbit/s both carry 8000 bytes per second; take
+                # the mean over the capture, as single steps can be irregular.
+                seq = s["seq"]
+                span = (seq[-1][0] - seq[0][0]) & 0xFFFFFFFF
+                total = sum(size for _, size in seq[:-1])
+                if span and total:
+                    f.audio_clock = round(span * 8000 / total)
+                    steps = sorted({(b[0] - a[0]) & 0xFFFFFFFF for a, b in itertools.pairwise(seq)})
+                    print(
+                        f"audio RTP clock: about {f.audio_clock} Hz over {len(seq)} packets "
+                        f"(timestamp steps {steps[:8]})"
+                    )
         if first_idr is not None:
             f.startup = f"first keyframe {first_idr * 1000:.0f} ms after PLAY"
             print(f.startup)
@@ -836,79 +1169,131 @@ def step_stream(args, f: Findings, uri: str) -> None:
         rtsp.close()
 
 
-def step_beep(args, f: Findings, uri: str) -> None:
-    section("Talk-back test: 1 s beep through the doorbell speaker")
+def beep_payload(codec: str, pattern: list[tuple[float, float]], freq: float) -> bytes:
+    """Tone bursts (seconds on, seconds off) encoded for the backchannel codec."""
+    if codec == "G722":
+        pcm: list[int] = []
+        for on, off in pattern:
+            pcm += [
+                int(16000 * math.sin(2 * math.pi * freq * i / 16000))
+                for i in range(int(on * 16000))
+            ]
+            pcm += [0] * int(off * 16000)
+        return G722Encoder().encode(pcm)
+    encoder = linear_to_alaw if codec == "PCMA" else linear_to_ulaw
+    return b"".join(
+        tone(encoder, on, freq=freq) + tone(encoder, off, freq=0.0) for on, off in pattern
+    )
+
+
+def send_beeps(args, f: Findings, uri: str, pattern: list[tuple[float, float]], freq: float) -> str:
+    """Open a backchannel-only session, play the bursts in real time, tear down."""
     rtsp = Rtsp(args.host, args.rtsp_port, args.user, args.password)
     try:
         resp = rtsp.request(
             "DESCRIBE", uri, {"Accept": "application/sdp", "Require": REQUIRE_BACKCHANNEL}
         )
         if resp.status != 200:
-            f.beep = f"DESCRIBE with backchannel refused ({resp.status})"
-            print(f.beep)
-            return
+            return f"DESCRIBE with backchannel refused ({resp.status})"
         base = resp.headers.get("content-base", uri)
         medias = parse_sdp(resp.body.decode(errors="replace"))
-        back = next(
-            (m for m in medias if m.kind == "audio" and m.direction == "sendonly"), None
-        ) or next((m for m in medias if m.kind == "audio" and m.direction == "recvonly"), None)
-        if back is None:
-            f.beep = "no backchannel track in SDP"
-            print(f.beep)
-            return
-        codec = None
-        for payload in back.payloads:
-            pt, name = payload.split(" ", 1)
-            upper = name.upper()
-            if upper.startswith("PCMA/8000"):
-                codec = (int(pt), linear_to_alaw)
-                break
-            if upper.startswith("PCMU/8000"):
-                codec = (int(pt), linear_to_ulaw)
-        if codec is None:
-            f.beep = f"backchannel codec {back.payloads} not supported by this probe"
-            print(f.beep)
-            return
+        back = next((m for m in medias if m.kind == "audio" and m.control == f.back_control), None)
+        if back is None or not f.back_control or not back.payloads:
+            return "no backchannel track in SDP"
+        pt_text, rtpmap = back.payloads[0].split(" ", 1)
+        name, _, rate = rtpmap.partition("/")
+        codec = name.upper()
+        if codec not in ("G722", "PCMA", "PCMU"):
+            return f"backchannel codec {back.payloads} not supported by this probe"
+        # The SDP's clock, as the integration uses; the measured one is only reported.
+        clock = int(rate.split("/")[0] or 8000)
         setup = rtsp.request(
             "SETUP",
             media_url(base, back.control),
             {"Transport": "RTP/AVP/TCP;unicast;interleaved=0-1", "Require": REQUIRE_BACKCHANNEL},
         )
-        print(f"SETUP backchannel -> {setup.status} {setup.headers.get('transport', '')}")
+        transport = setup.headers.get("transport", "")
+        print(f"SETUP backchannel -> {setup.status} {transport}")
+        if setup.status != 200:
+            return f"SETUP refused ({setup.status})"
+        assigned = re.search(r"interleaved=(\d+)", transport)
+        channel = int(assigned.group(1)) if assigned else 0
         play = rtsp.request("PLAY", base, {"Range": "npt=0.000-", "Require": REQUIRE_BACKCHANNEL})
         print(f"PLAY -> {play.status}")
         if play.status != 200:
-            f.beep = f"PLAY refused ({play.status})"
-            return
-        pt, encoder = codec
-        audio = tone(encoder, 1.0) + tone(encoder, 0.3, freq=0.0)
-        ssrc = secrets.randbits(32)
-        seq, ts = secrets.randbits(16), secrets.randbits(32)
+            return f"PLAY refused ({play.status})"
+        payload, pt = beep_payload(codec, pattern, freq), int(pt_text)
+        ts_step = clock // 50  # 20 ms; G.722 and G.711 both use 160 bytes per 20 ms
+        ssrc, seq, ts = secrets.randbits(32), secrets.randbits(16), secrets.randbits(32)
         start = time.monotonic()
-        for i in range(0, len(audio), 160):  # 20 ms packets at 8 kHz
-            chunk = audio[i : i + 160]
-            rtp = (
-                struct.pack(
-                    ">BBHII",
-                    0x80,
-                    pt | (0x80 if i == 0 else 0),
-                    seq & 0xFFFF,
-                    ts & 0xFFFFFFFF,
-                    ssrc,
-                )
-                + chunk
+        for n, i in enumerate(range(0, len(payload), 160)):
+            header = struct.pack(
+                ">BBHII", 0x80, pt | (0x80 if n == 0 else 0), seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc
             )
-            rtsp.sock.sendall(b"$" + struct.pack(">BH", 0, len(rtp)) + rtp)
+            rtp = header + payload[i : i + 160]
+            rtsp.sock.sendall(b"$" + struct.pack(">BH", channel, len(rtp)) + rtp)
             seq += 1
-            ts += len(chunk)
-            delay = start + (i // 160 + 1) * 0.02 - time.monotonic()
+            ts += ts_step
+            delay = start + (n + 1) * 0.02 - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
         rtsp.request("TEARDOWN", base)
-        f.beep = f"sent 1 s tone as PT {pt}: did you hear it at the door?"
-        print(f.beep)
+        return f"sent {codec} PT {pt}, RTP clock {clock}, channel {channel}"
     finally:
         rtsp.close()
+
+
+def step_beep(args, f: Findings, uri: str) -> None:
+    section("Talk-back test through the doorbell speaker")
+    # A: three short high beeps, the backchannel alone
+    first_try = send_beeps(args, f, uri, [(0.35, 0.25)] * 3 + [(0.0, 0.5)], 1000.0)
+    print(f"A (3 short beeps, alone): {first_try}")
+    # B: two long low beeps while another session watches the stream, as go2rtc will
+    viewer = Rtsp(args.host, args.rtsp_port, args.user, args.password)
+    received = 0
+    try:
+        # like go2rtc: the backchannel header, then only the tracks it receives
+        require = {"Require": REQUIRE_BACKCHANNEL}
+        resp = viewer.request("DESCRIBE", uri, {"Accept": "application/sdp", **require})
+        base = resp.headers.get("content-base", uri)
+        medias = [
+            m
+            for m in parse_sdp(resp.body.decode(errors="replace"))
+            if m.kind in ("video", "audio") and m.control != f.back_control
+        ]
+        for index, media in enumerate(medias):
+            viewer.request(
+                "SETUP",
+                media_url(base, media.control),
+                {
+                    "Transport": f"RTP/AVP/TCP;unicast;interleaved={index * 2}-{index * 2 + 1}",
+                    **require,
+                },
+            )
+        viewer.request("PLAY", base, {"Range": "npt=0.000-", **require})
+        stop = time.monotonic() + 30
+        counter = [0]
+
+        def watch() -> None:
+            with suppress(OSError):
+                for _, payload, _ in viewer.read_interleaved(stop):
+                    counter[0] += len(payload)
+                    if time.monotonic() > stop:
+                        break
+
+        reader = threading.Thread(target=watch, daemon=True)
+        reader.start()
+        time.sleep(1)
+        second_try = send_beeps(args, f, uri, [(0.8, 0.4)] * 2, 700.0)
+        received = counter[0]
+        stop = time.monotonic()
+    finally:
+        viewer.close()
+    print(f"B (2 long beeps, with a viewer receiving {received // 1024} KB): {second_try}")
+    f.beep = f"A: {first_try} | B with viewer: {second_try}"
+    print(
+        "\a>>> Bips envoyés : 3 courts et aigus, puis 2 longs et graves. Dis-moi lesquels tu as entendus."
+    )
 
 
 def step_nvr(cam: Onvif, args, f: Findings) -> None:
@@ -1001,11 +1386,14 @@ def run(args) -> Findings:
             print(f"!! nvr: {err}")
     if args.events:
         try:
-            step_events(cam, f, args.events)
+            step_events(cam, f, args.events, args.beep)
         except (OnvifError, OSError, ET.ParseError) as err:
             f.errors.append(f"events: {err}")
             print(f"!! events: {err}")
     if args.beep and uris:
+        if not f.rang:
+            print("\a\n>>> Bips dans 30 s : va devant la porte pour les écouter.\n")
+            time.sleep(30)
         try:
             step_beep(args, f, uris[0])
         except OSError as err:
@@ -1022,16 +1410,16 @@ def main() -> int:
     parser.add_argument("--onvif-port", type=int, default=8080)
     parser.add_argument("--rtsp-port", type=int, default=8554)
     parser.add_argument(
-        "--mac", default="9c:75:6e:12:34:56", help="fallback RTSP path when GetStreamUri fails"
+        "--mac", default="", help="device MAC, for the RTSP path when GetStreamUri fails"
     )
     parser.add_argument(
-        "--events", type=int, default=90, help="seconds to listen to events (0 = skip)"
+        "--events", type=int, default=180, help="seconds to listen to events (0 = skip)"
     )
     parser.add_argument(
         "--stream", type=int, default=6, help="seconds of stream analysis (0 = skip)"
     )
     parser.add_argument(
-        "--beep", action="store_true", help="play a 1 s tone through the doorbell speaker"
+        "--beep", action="store_true", help="play 3 beeps through the doorbell speaker"
     )
     parser.add_argument("--nvr", action="store_true", help="query Profile G recording services")
     parser.add_argument("--report", default="", help="also save the report to this file")
@@ -1045,13 +1433,11 @@ def main() -> int:
         )
         return 2
 
-    out = io.StringIO()
-
     class Tee(io.TextIOBase):
         def write(self, s):
             sys.__stdout__.write(s)
             sys.__stdout__.flush()
-            out.write(s)
+            REPORT.write(s)
             return len(s)
 
     with redirect_stdout(Tee()):
@@ -1061,15 +1447,21 @@ def main() -> int:
         f = run(args)
         section("Summary")
         print(f"model           {f.model} firmware {f.firmware}")
+        print(f"clock           {f.clock}")
         print(f"stream URIs     {[hide(u) for u in f.stream_uris] or 'none from ONVIF'}")
-        print(f"snapshot        {hide(f.snapshot) or 'none'}")
+        print(f"snapshot        {hide(f.snapshot) or 'none'}; {f.snapshot_fetch}")
         print(f"audio codec     {f.audio_codec}")
         print(f"backchannel     {f.backchannel}")
         print(f"ring topic      {f.ring_topic}")
         print(
             f"ring events     {len(f.ring_seen)} seen"
-            + (f": {f.ring_seen[0]}" if f.ring_seen else "")
+            + (f": {f.ring_line or f.ring_seen[0]}" if f.ring_seen else "")
         )
+        print(f"ring delay      {f.ring_delay}")
+        print(f"pull            {f.pull}")
+        print(f"topic filter    {f.topic_filter}")
+        print(f"event rates     {f.rates}")
+        print(f"audio RTP clock {f.audio_clock or '?'}")
         print(f"video           {f.bitrate}; {f.gop}; {f.startup}")
         print(f"profile G       {f.profile_g}")
         print(f"beep            {f.beep}")
@@ -1077,7 +1469,7 @@ def main() -> int:
             print(f"errors          {f.errors}")
     if args.report:
         with open(args.report, "w", encoding="utf-8") as handle:
-            handle.write(out.getvalue())
+            handle.write(REPORT.getvalue())
         print(f"\nReport saved to {args.report} (no password inside).")
     return 0
 

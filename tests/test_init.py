@@ -252,18 +252,16 @@ async def test_events_refused(
 
 @pytest.mark.usefixtures("mock_describe")
 async def test_motion_follows_the_device(hass: HomeAssistant, mock_entry: MockConfigEntry) -> None:
-    """Motion stays on while the device says so; AI detections time out."""
+    """Motion stays on while the device says so; an AI detection never cleared times out."""
     await _setup(hass, mock_entry)
     doorbell = mock_entry.runtime_data
-    doorbell._on_event(
-        OnvifEvent(
-            "tns1:RuleEngine/tnsajax:MotionDetector/Detection",
-            "Changed",
-            None,
-            {},
-            {"State": "true"},
+
+    def motion(value: str) -> OnvifEvent:
+        return OnvifEvent(
+            "tns1:RuleEngine/tnsajax:MotionDetector/Detection", "", None, {}, {"State": value}
         )
-    )
+
+    doorbell._on_event(motion("true"))
     doorbell._on_event(
         OnvifEvent(
             "tns1:RuleEngine/tnsajax:ObjectDetector/Detection",
@@ -276,18 +274,78 @@ async def test_motion_follows_the_device(hass: HomeAssistant, mock_entry: MockCo
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
     await hass.async_block_till_done()
     assert hass.states.get(_entity(hass, "binary_sensor", "motion")).state == "on"
+    assert hass.states.get(_entity(hass, "binary_sensor", "person")).state == "on"
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+    await hass.async_block_till_done()
     assert hass.states.get(_entity(hass, "binary_sensor", "person")).state == "off"
-    doorbell._on_event(
-        OnvifEvent(
-            "tns1:RuleEngine/tnsajax:MotionDetector/Detection",
-            "Changed",
-            None,
-            {},
-            {"State": "false"},
-        )
-    )
+    doorbell._on_event(motion("false"))
     await hass.async_block_till_done()
     assert hass.states.get(_entity(hass, "binary_sensor", "motion")).state == "off"
+
+
+@pytest.mark.usefixtures("mock_describe")
+async def test_ajax_messages(hass: HomeAssistant, mock_entry: MockConfigEntry) -> None:
+    """Real DoorBell traffic: PIR, tracking boxes and repeated states do not mislead."""
+    await _setup(hass, mock_entry)
+    doorbell = mock_entry.runtime_data
+    calls = async_capture_events(hass, EVENT_CALL)
+    for event in parse_notifications(load_xml("pull_messages_ajax.xml")):
+        doorbell._on_event(event)
+    await hass.async_block_till_done()
+    # The tracking message (no ClassTypes) does not clear the person.
+    assert hass.states.get(_entity(hass, "binary_sensor", "person")).state == "on"
+    # PIR turning off does not clear the camera's motion, and has its own sensor.
+    assert hass.states.get(_entity(hass, "binary_sensor", "motion")).state == "on"
+    assert hass.states.get(_entity(hass, "binary_sensor", "pir")).state == "off"
+    # "Detected" repeated while the button is held is one press.
+    assert [c.data["type"] for c in calls] == ["ring"]
+    assert hass.states.get(_entity(hass, "sensor", "call_state")).state == "ringing"
+    assert [e["topic"].rsplit("/", 2)[-2] for e in doorbell.last_events] == [
+        "ObjectDetection",
+        "tnsajax:PirMotionDetector",
+        "tnsajax:MotionDetector",
+        "tnsajax:RingDetector",
+        "tnsajax:PirMotionDetector",
+    ]
+    doorbell.call.shutdown()
+
+
+@pytest.mark.usefixtures("mock_describe")
+async def test_detections_combine_rules(hass: HomeAssistant, mock_entry: MockConfigEntry) -> None:
+    """A detection is on while any rule reports it."""
+    await _setup(hass, mock_entry)
+    doorbell = mock_entry.runtime_data
+
+    def objects(rule: str, classes: str) -> OnvifEvent:
+        return OnvifEvent(
+            "tns1:RuleEngine/ObjectDetection/Object",
+            "Changed",
+            None,
+            {"Rule": rule},
+            {"ClassTypes": classes},
+        )
+
+    person = _entity(hass, "binary_sensor", "person")
+    doorbell._on_event(objects("r1", "Human"))
+    doorbell._on_event(objects("r2", ""))
+    await hass.async_block_till_done()
+    assert hass.states.get(person).state == "on"
+    doorbell._on_event(objects("r1", ""))
+    await hass.async_block_till_done()
+    assert hass.states.get(person).state == "off"
+
+
+@pytest.mark.usefixtures("mock_describe")
+async def test_subscription_topics(hass: HomeAssistant, mock_entry: MockConfigEntry) -> None:
+    """The subscription asks for the used topics only, without the tracking flood."""
+    await _setup(hass, mock_entry)
+    assert mock_entry.runtime_data.events.topics == [
+        "tns1:RuleEngine/tnsajax:RingDetector/Detection",
+        "tns1:RuleEngine/tnsajax:PirMotionDetector/Detection",
+        "tns1:RuleEngine/ObjectDetection/Object",
+        "tns1:RuleEngine/tnsajax:MotionDetector/Detection",
+        "tns1:VideoSource/MotionAlarm",
+    ]
 
 
 @pytest.mark.usefixtures("mock_describe")
@@ -306,3 +364,26 @@ async def test_prefixed_ring_topic(hass: HomeAssistant, mock_entry: MockConfigEn
     await hass.async_block_till_done()
     assert hass.states.get(_entity(hass, "sensor", "call_state")).state == "ringing"
     mock_entry.runtime_data.call.shutdown()
+
+
+async def test_card_is_served(hass: HomeAssistant, mock_entry: MockConfigEntry) -> None:
+    """With a web server, the card is served and loaded on every dashboard."""
+    hass.config.components.add("frontend")
+    with (
+        patch(
+            "homeassistant.components.http.HomeAssistantHTTP.async_register_static_paths",
+            AsyncMock(),
+        ) as register,
+        patch("custom_components.ajax_doorbell.add_extra_js_url") as add_url,
+        patch(
+            "custom_components.ajax_doorbell.doorbell.async_describe",
+            AsyncMock(return_value=DESCRIPTION),
+        ),
+    ):
+        await _setup(hass, mock_entry)
+    (paths,) = register.await_args.args
+    assert paths[0].url_path == "/ajax_doorbell/ajax-doorbell-card.js"
+    assert paths[0].path.endswith("frontend/ajax-doorbell-card.js")
+    url = add_url.call_args.args[1]
+    assert url.startswith("/ajax_doorbell/ajax-doorbell-card.js?v=")
+    assert len(url.rsplit("=", 1)[1]) == 10

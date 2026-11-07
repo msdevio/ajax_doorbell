@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import re
 from typing import Any
 
 import aiohttp
@@ -105,12 +106,45 @@ def test_parse_profiles() -> None:
 
 
 def test_parse_topics() -> None:
-    """The topic set flattens with the Ajax prefixes."""
+    """The DoorBell's topic set flattens with the Ajax prefixes."""
     assert parse_topics(load_xml("get_event_properties.xml")) == [
-        "tns1:RuleEngine/RingDetector/Detection",
-        "tns1:RuleEngine/tnsajax:MotionDetector/Detection",
+        "tns1:Advancedsecurity/Keystore/KeyStatus",
+        "tns1:RuleEngine/LineDetector/Crossed",
+        "tns1:RuleEngine/tnsajax:RingDetector/Detection",
+        "tns1:RuleEngine/tnsajax:PirMotionDetector/Detection",
+        "tns1:RuleEngine/tnsajax:SmartSearch/ObjectAppearance",
+        "tns1:RuleEngine/ObjectDetection/Object",
+        "tns1:RuleEngine/tnsajax:LineDetector/Crossing",
         "tns1:RuleEngine/tnsajax:ObjectDetector/Detection",
+        "tns1:RuleEngine/tnsajax:MotionDetector/Detection",
+        "tns1:VideoSource/MotionAlarm",
     ]
+
+
+async def test_pullpoint_topic_filter() -> None:
+    """A filtered subscription names the topics with their namespaces."""
+    created = (
+        b'<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://'
+        b'www.w3.org/2005/08/addressing" xmlns:tev="http://www.onvif.org/ver10/events/wsdl">'
+        b"<s:Body><tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference>"
+        b"<wsa:Address>http://192.168.1.9:8080/onvif/event_service?sub=7</wsa:Address>"
+        b"</tev:SubscriptionReference></tev:CreatePullPointSubscriptionResponse></s:Body>"
+        b"</s:Envelope>"
+    )
+    session = FakeSession([(200, created)])
+    client = AjaxOnvifClient(session, HOST, 8080, "u", "p")
+    topics = [
+        "tns1:RuleEngine/tnsajax:RingDetector/Detection",
+        "tns1:VideoSource/MotionAlarm",
+    ]
+    await client.async_create_pullpoint(600, topics)
+    body = session.calls[0]["data"].decode()
+    expression = re.search(r"<wsnt:TopicExpression ([^>]*)>([^<]*)<", body)
+    assert expression.group(2) == "|".join(topics)
+    assert 'xmlns:tnsajax="http://ajax.systems/onvif/topics"' in expression.group(1)
+    assert 'xmlns:tns1="http://www.onvif.org/ver10/topics"' in expression.group(1)
+    assert "ConcreteSet" in expression.group(1)
+    assert body.index("<Filter>") < body.index("<InitialTerminationTime>")
 
 
 def test_parse_notifications() -> None:

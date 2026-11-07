@@ -15,17 +15,23 @@ officielle ONVIF et RTSP : ni cloud Ajax, ni mot de passe du compte Ajax.
 - **Vidéo live** par le go2rtc intégré à Home Assistant, en WebRTC. Le flux H.264
   est copié tel quel, jamais réencodé : environ 0,3 s de bout en bout sur le LAN.
 - **Écouter** : l'audio G.722 de la DoorBell arrive dans le navigateur en Opus.
-- **Parler** : le micro du navigateur repart vers le haut-parleur de la DoorBell par
-  le canal de retour audio ONVIF (backchannel). L'intégration vérifie à la
-  configuration que la DoorBell en propose un ; avec Home Assistant 2026.11, la
-  caméra déclare alors l'audio bidirectionnel et le bouton **Parler** de Home
-  Assistant (aperçu Labs) fonctionne aussi.
-- **Sonnerie en moins d'une seconde** grâce à l'événement ONVIF local de la DoorBell
-  (`RingDetector`), sous forme d'entité `event` de classe `doorbell`.
+- **Parler** : le micro du navigateur part vers le haut-parleur de la DoorBell par
+  son canal de retour audio ONVIF (backchannel). La DoorBell n'y accepte que le
+  G.722, que go2rtc ne sait pas produire depuis un navigateur : la carte interphone
+  encode donc elle-même le micro (à l'octet près comme l'encodeur de FFmpeg) et
+  l'intégration le joue sur le backchannel, par le websocket de Home Assistant : aucun
+  port en plus, et ça marche aussi à distance. Un seul écran parle à la fois : le
+  dernier qui décroche prend la main.
+- **Sonnerie en moins d'une demi-seconde** (50 à 500 ms mesurées) grâce à
+  l'événement ONVIF local de la DoorBell (`RingDetector`), sous forme d'entité
+  `event` de classe `doorbell`.
 - **État d'appel partagé par tous les écrans** : inactif, sonne, en cours. Décrocher
   sur un écran arrête la sonnerie partout ; les sonneries sans réponse comptent comme
   appels manqués.
-- **Détections** : mouvement, personne, véhicule et animal, par l'IA de la DoorBell.
+- **Détections** : mouvement vu par la caméra, mouvement PIR, et personne, véhicule
+  et animal par l'IA de la DoorBell. L'abonnement ne demande que ces sujets, ce qui
+  évite au réseau le suivi d'objets en direct de la DoorBell (plusieurs messages par
+  seconde).
 - **Carte interphone** `custom:ajax-doorbell-card` et **blueprint de notification**
   (Décrocher, Voir, Ignorer, Ouvrir la porte).
 - Découverte DHCP, réauthentification, reconfiguration, diagnostics, français et
@@ -34,7 +40,7 @@ officielle ONVIF et RTSP : ni cloud Ajax, ni mot de passe du compte Ajax.
 ## Prérequis
 
 - Ajax DoorBell en firmware 2.377 ou plus récent (prise en charge ONVIF).
-- Home Assistant 2026.10 ou plus récent. La 2026.11 ajoute le bouton Parler natif.
+- Home Assistant 2026.10 ou plus récent.
 - HTTPS pour utiliser le micro dans le navigateur ou l'app compagnon.
 
 ## 1. Préparer la DoorBell dans l'app Ajax
@@ -71,7 +77,9 @@ avec son adresse IP et l'utilisateur ONVIF.
 | `sensor.<sonnette>_appel` | `idle`, `ringing` ou `in_call`, avec `answered_by` et les heures |
 | `sensor.<sonnette>_derniere_sonnerie` | Heure du dernier appui |
 | `sensor.<sonnette>_appels_manques` | Sonneries sans réponse depuis la dernière remise à zéro |
-| `binary_sensor.<sonnette>_mouvement`, `_personne`, `_vehicule`, `_animal` | Détections |
+| `binary_sensor.<sonnette>_mouvement` | Mouvement vu par la caméra |
+| `binary_sensor.<sonnette>_mouvement_pir` | Mouvement vu par le capteur PIR |
+| `binary_sensor.<sonnette>_personne`, `_vehicule`, `_animal` | Détections de l'IA |
 | `binary_sensor.<sonnette>_flux_d_evenements` | Santé de l'abonnement aux événements ONVIF (diagnostic) |
 
 Les identifiants exacts dépendent du nom de l'appareil et de la langue de Home
@@ -98,10 +106,9 @@ le cas.
 
 ## Carte interphone
 
-1. Copie `card/ajax-doorbell-card.js` dans ton dossier `config/www/`.
-2. **Paramètres → Tableaux de bord → ⋮ → Ressources → Ajouter une ressource** :
-   `/local/ajax-doorbell-card.js`, type **Module JavaScript**.
-3. Ajoute la carte à une vue (une vue « Interphone » dédiée est idéale) :
+L'intégration fournit la carte et la charge sur tous les tableaux de bord : rien à
+copier, aucune ressource à ajouter, et chaque mise à jour arrive aussitôt dans les
+navigateurs. Ajoute la carte à une vue (une vue « Interphone » dédiée est idéale) :
 
 ```yaml
 type: custom:ajax-doorbell-card
@@ -141,11 +148,17 @@ toute seule, comme un appel entrant.
 ## Dépannage
 
 - **Pas de micro** : la page doit être servie en HTTPS (ou `http://localhost`).
-- **Pas de bouton Parler ou pas de son à la porte** : regarde l'attribut
-  `two_way_audio` du capteur d'appel et le backchannel dans les diagnostics. Parler
-  demande que la DoorBell propose un backchannel en G.711 ou Opus.
+- **Pas de bouton Parler ou pas de son à la porte** : le capteur d'appel doit
+  afficher `two_way_audio: true` et `talk_via: relay`, et les diagnostics un
+  `talk_codec`. Le bouton Parler de Home Assistant reste masqué pour cette DoorBell :
+  son backchannel est en G.722, on parle donc par la carte interphone.
+- **« Le micro a été repris sur un autre écran »** : un seul écran parle à la fois,
+  le dernier qui décroche.
 - **Latence plus élevée** : ne règle pas d'orientation de caméra dans Home Assistant
-  (elle force le réencodage de la vidéo) et évite les lecteurs HLS.
+  (elle force le réencodage de la vidéo) et évite les lecteurs HLS. La DoorBell
+  envoie une image clé environ 130 ms après une nouvelle connexion : la vidéo démarre
+  donc le plus vite avec **Précharger le flux** désactivé ; si tu l'actives, un GOP
+  d'une seconde garde un démarrage court.
 - **Accès à distance en 4G** : le média passe directement en WebRTC. Derrière un NAT
   mobile strict, déclare un serveur TURN sous `web_rtc: ice_servers:` dans
   `configuration.yaml`.
@@ -155,7 +168,8 @@ toute seule, comme un appel entrant.
 ## Fonctionnement
 
 ```
-DoorBell ── RTSP 8554 (H.264, G.722, backchannel) ──► go2rtc ── WebRTC ──► navigateur
+DoorBell ── RTSP 8554 (H.264, G.722) ──► go2rtc ── WebRTC ──► navigateur (vidéo, écoute)
+navigateur ── websocket (trames G.722) ──► ajax_doorbell ── backchannel RTSP ──► haut-parleur
 DoorBell ── ONVIF 8080 (événements PullPoint) ──► ajax_doorbell ──► entités, appel, notification
 ```
 

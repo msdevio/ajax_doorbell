@@ -14,6 +14,7 @@ from custom_components.ajax_doorbell.events import EventStream
 from custom_components.ajax_doorbell.onvif import (
     OnvifAuthError,
     OnvifConnectionError,
+    OnvifError,
     PullPoint,
     parse_notifications,
 )
@@ -143,4 +144,63 @@ async def test_refusal_is_reported_once_and_retried(
     await _spin(60)
     assert stream.connected is True
     assert recorder.recovered == [1]
+    await stream.async_stop()
+
+
+async def test_refused_filter_falls_back(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """A device that refuses the topic filter gets a plain subscription, for good."""
+    client = _client()
+    client.async_create_pullpoint.side_effect = [
+        OnvifError("InvalidFilterFault"),
+        PullPoint("http://x/sub"),
+    ]
+    gate = asyncio.Event()
+
+    async def pull(pullpoint: PullPoint, wait: int) -> list:
+        await gate.wait()
+        return []
+
+    client.async_pull = pull
+    recorder = Recorder()
+    stream = recorder.stream(hass, client)
+    stream.topics = ["tns1:RuleEngine/tnsajax:RingDetector/Detection"]
+    stream.start(entry)
+    await _spin()
+    calls = client.async_create_pullpoint.await_args_list
+    assert [call.args[1:] for call in calls] == [(stream.topics,), ()]
+    assert stream.filtered is False
+    await stream.async_stop()
+
+
+async def test_silent_filter_is_dropped(
+    hass: HomeAssistant, entry: MockConfigEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing at all through the filter means it filters too much."""
+    monkeypatch.setattr(events, "FILTER_SILENCE", 0)
+    client = _client()
+    batch = parse_notifications(load_xml("pull_messages_ajax.xml"))
+    gate = asyncio.Event()
+    pulls: list[bool] = []
+
+    async def pull(pullpoint: PullPoint, wait: int) -> list:
+        pulls.append(stream.filtered)
+        if stream.filtered:
+            return []
+        if len(pulls) == 2:
+            return batch
+        await gate.wait()
+        return []
+
+    client.async_pull = pull
+    recorder = Recorder()
+    stream = recorder.stream(hass, client)
+    stream.topics = ["tns1:RuleEngine/tnsajax:RingDetector/Detection"]
+    stream.start(entry)
+    await _spin(60)
+    assert pulls[:2] == [True, False]
+    assert recorder.events == batch
+    assert [call.args[1:] for call in client.async_create_pullpoint.await_args_list] == [
+        (stream.topics,),
+        (),
+    ]
     await stream.async_stop()
