@@ -114,9 +114,12 @@ two_way_audio: true                      # true forces talk-back, false listen o
 push_to_talk: false                      # hold the button to talk
 preview_on_ring: true                    # start the video muted as soon as it rings
 ring_sound: false                        # ringtone in the browser
-ring_tone: chime                         # chime, classic, westminster, digital or soft
+ring_tone: chime                         # 22 tones: chime, classic, westminster, harp, zen, bird…
 ring_volume: 55                          # 0 to 100
 ring_tone_url: /local/ringtone.mp3       # optional: your own file in config/www/
+lock: lock.front_door                    # optional: an "Open" button (any lock, e.g. Nuki)
+lock_action: open                        # open (pull the latch) or unlock
+lock_confirm: true                       # press twice to open
 fullscreen_on_ring: false
 show_stats: false                        # RTT, jitter, resolution, codecs
 auto_retry: true

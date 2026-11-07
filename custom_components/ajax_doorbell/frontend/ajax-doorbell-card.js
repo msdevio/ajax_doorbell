@@ -34,7 +34,7 @@
  * it the card still shows the video and plays the sound.
  */
 
-const CARD_VERSION = "0.2.4";
+const CARD_VERSION = "0.2.5";
 const DOMAIN = "ajax_doorbell";
 
 const KEEPALIVE_MS = 60000; // re-answer during our call: the integration ends unattended calls
@@ -47,27 +47,95 @@ const STABLE_MS = 30000; // a connection up this long earns a new automatic retr
 const STATS_MS = 2000;
 const FLASH_MS = 3500;
 const RING_REPEAT_MS = 3000;
-// Built-in ringtones: notes as [frequency Hz, start s, length s], played by a voice.
+// Built-in ringtones. Notes: [frequency Hz, start s, length s, gain (1), glide-to Hz].
+const N = {
+  G3: 196.0, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, G4: 392.0, A4: 440.0, B4: 493.88,
+  C5: 523.25, D5: 587.33, Eb5: 622.25, E5: 659.25, F5: 698.46, G5: 783.99, A5: 880.0, B5: 987.77,
+  C6: 1046.5, D6: 1174.66, E6: 1318.51, G6: 1567.98, C7: 2093.0,
+};
 const RING_TONES = {
-  chime: { voice: "bell", notes: [[659.25, 0, 1.2], [523.25, 0.55, 1.7]] },
-  classic: { voice: "bell", notes: [[783.99, 0, 1.1], [622.25, 0.65, 1.9]] },
+  chime: { voice: "bell", notes: [[N.E5, 0, 1.2], [N.C5, 0.55, 1.7]] },
+  classic: { voice: "bell", notes: [[N.G5, 0, 1.1], [N.Eb5, 0.65, 1.9]] },
   westminster: {
     voice: "bell",
     repeat: 4500,
-    notes: [[659.25, 0, 0.9], [523.25, 0.55, 0.9], [587.33, 1.1, 0.9], [392.0, 1.65, 2.2]],
+    notes: [[N.E5, 0, 0.9], [N.C5, 0.55, 0.9], [N.D5, 1.1, 0.9], [N.G4, 1.65, 2.2]],
   },
-  digital: { voice: "beep", repeat: 2000, notes: [[1046.5, 0, 0.12], [1046.5, 0.2, 0.12], [1046.5, 0.4, 0.12]] },
-  soft: { voice: "soft", repeat: 3500, notes: [[523.25, 0, 1.4], [659.25, 0.3, 1.4], [783.99, 0.6, 1.9]] },
+  digital: { voice: "beep", repeat: 2000, notes: [[N.C6, 0, 0.12], [N.C6, 0.2, 0.12], [N.C6, 0.4, 0.12]] },
+  soft: { voice: "soft", repeat: 3500, notes: [[N.C5, 0, 1.4], [N.E5, 0.3, 1.4], [N.G5, 0.6, 1.9]] },
+  three_tones: { voice: "bell", notes: [[N.G5, 0, 1.0], [N.E5, 0.4, 1.0], [N.C5, 0.8, 1.8]] },
+  arpeggio: { voice: "marimba", notes: [[N.C5, 0, 0.5], [N.E5, 0.15, 0.5], [N.G5, 0.3, 0.5], [N.C6, 0.45, 1.0]] },
+  xylophone: {
+    voice: "marimba",
+    repeat: 2500,
+    notes: [[N.C6, 0, 0.3], [N.D6, 0.1, 0.3], [N.E6, 0.2, 0.3], [N.G6, 0.3, 0.3], [N.E6, 0.45, 0.3], [N.C6, 0.6, 0.6]],
+  },
+  harp: {
+    voice: "pluck",
+    notes: [[N.C5, 0, 0.8], [N.E5, 0.1, 0.8], [N.G5, 0.2, 0.8], [N.C6, 0.3, 0.9], [N.G5, 0.4, 0.8], [N.E5, 0.5, 0.8], [N.C5, 0.6, 1.2]],
+  },
+  tubular: { voice: "tube", repeat: 4500, notes: [[N.D5, 0, 2.5], [N.A4, 0.9, 3.0]] },
+  church: { voice: "tube", repeat: 4500, notes: [[N.G3, 0, 3.5, 1.4], [N.G3, 1.6, 3.5, 1.4]] },
+  alert: { voice: "beep", repeat: 2500, notes: [[N.A5, 0, 0.25], [N.E5, 0.3, 0.25], [N.A5, 0.6, 0.25], [N.E5, 0.9, 0.25]] },
+  retro: {
+    voice: "phone",
+    notes: Array.from({ length: 20 }, (_, i) => [i % 2 ? 480 : 440, i * 0.05, 0.06]),
+  },
+  synth: {
+    voice: "synth",
+    repeat: 3500,
+    notes: [[N.C5, 0, 1.2], [N.E5, 0, 1.2], [N.G5, 0, 1.2], [N.F5, 0.6, 1.4], [N.A5, 0.6, 1.4], [N.C6, 0.6, 1.4]],
+  },
+  sparkle: { voice: "bell", notes: [[N.C6, 0, 0.7], [N.E6, 0.12, 0.7], [N.G6, 0.24, 0.7], [N.C7, 0.36, 1.2]] },
+  lullaby: {
+    voice: "soft",
+    repeat: 4500,
+    notes: [[N.E5, 0, 0.9], [N.G5, 0.45, 0.9], [N.E5, 0.9, 0.9], [N.C5, 1.35, 1.6]],
+  },
+  marimba: {
+    voice: "marimba",
+    notes: [[N.G4, 0, 0.4], [N.C5, 0.2, 0.4], [N.E5, 0.4, 0.4], [N.G4, 0.7, 0.4], [N.C5, 0.9, 0.4], [N.E5, 1.1, 0.8]],
+  },
+  echo: { voice: "bell", notes: [[N.A5, 0, 1.0, 1], [N.A5, 0.35, 1.0, 0.5], [N.A5, 0.7, 1.0, 0.25], [N.A5, 1.05, 1.2, 0.12]] },
+  cascade: {
+    voice: "marimba",
+    notes: [[N.C6, 0, 0.4], [N.A5, 0.1, 0.4], [N.G5, 0.2, 0.4], [N.E5, 0.3, 0.4], [N.D5, 0.4, 0.4], [N.C5, 0.5, 0.9]],
+  },
+  fanfare: { voice: "brass", notes: [[N.G4, 0, 0.25], [N.C5, 0.25, 0.25], [N.E5, 0.5, 0.25], [N.G5, 0.75, 0.9]] },
+  zen: { voice: "bowl", repeat: 5000, notes: [[N.A3, 0, 4.0, 1.3]] },
+  bird: {
+    voice: "chirp",
+    repeat: 2500,
+    notes: [[2000, 0, 0.12, 1, 3200], [2200, 0.18, 0.12, 1, 3500], [2000, 0.36, 0.15, 1, 3000]],
+  },
 };
 const VOICES = {
   // A few inharmonic partials with fast decays sound like a chime, not a beep.
   bell: { type: "sine", attack: 0.012, partials: [[1, 0.6], [2.76, 0.14], [5.4, 0.05]] },
   beep: { type: "square", attack: 0.005, partials: [[1, 0.12]] },
   soft: { type: "sine", attack: 0.06, partials: [[1, 0.5], [3.99, 0.04]] },
+  marimba: { type: "sine", attack: 0.004, partials: [[1, 0.55], [4, 0.12], [9.9, 0.03]] },
+  pluck: { type: "triangle", attack: 0.003, partials: [[1, 0.45], [2, 0.12], [3, 0.05]] },
+  tube: { type: "sine", attack: 0.008, partials: [[1, 0.5], [2.76, 0.2], [5.4, 0.1], [8.93, 0.04]] },
+  phone: { type: "sine", attack: 0.004, partials: [[1, 0.35], [2, 0.08]] },
+  synth: { type: "sawtooth", attack: 0.01, partials: [[1, 0.06], [1.006, 0.06]] },
+  brass: { type: "sawtooth", attack: 0.03, partials: [[1, 0.15], [2, 0.04]] },
+  bowl: { type: "sine", attack: 0.02, partials: [[1, 0.5], [2.71, 0.15], [4.95, 0.06]] },
+  chirp: { type: "sine", attack: 0.01, partials: [[1, 0.3]] },
 };
 const FS_FALLBACK_MS = 1000;
 const TALK_READY_MS = 8000;
 const REPLAY_LEAD_MS = 5000; // a visit is replayed from a little before it started
+const DOOR_CONFIRM_MS = 4000;
+const CARD_DEFAULTS = Object.freeze({
+  preview_on_ring: true,
+  ring_sound: false,
+  fullscreen_on_ring: false,
+  push_to_talk: false,
+  show_stats: false,
+  auto_retry: true,
+  lock_confirm: true,
+});
 
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -302,6 +370,8 @@ const ICONS = {
   rewind: "mdi:rewind-10",
   forward: "mdi:fast-forward-10",
   live: "mdi:access-point",
+  door: "mdi:door-open",
+  doorDone: "mdi:check-circle",
 };
 
 const STRINGS = {
@@ -356,6 +426,13 @@ const STRINGS = {
     yesterday: "hier",
     replay_failed: "Relecture impossible : {message}",
     replay_in_call: "Raccroche pour revoir une visite.",
+    open_door: "Ouvrir",
+    open_door_title: "Ouvrir la porte",
+    door_confirm: "Confirmer ?",
+    door_opening: "Ouverture…",
+    door_opened: "Ouverte",
+    door_open: "Porte ouverte",
+    door_failed: "Ouverture impossible : {message}",
     mic_ended: "La sonnette a coupé le micro.",
     mic_relay: "La sonnette refuse le micro : {message}",
     err_ice: "Impossible de joindre la sonnette (réseau).",
@@ -428,6 +505,13 @@ const STRINGS = {
     yesterday: "yesterday",
     replay_failed: "Replay failed: {message}",
     replay_in_call: "Hang up to replay a visit.",
+    open_door: "Open",
+    open_door_title: "Open the door",
+    door_confirm: "Confirm?",
+    door_opening: "Opening…",
+    door_opened: "Open",
+    door_open: "Door open",
+    door_failed: "Could not open: {message}",
     mic_ended: "The doorbell closed the microphone.",
     mic_relay: "The doorbell refused the microphone: {message}",
     err_ice: "Can't reach the doorbell (network).",
@@ -948,6 +1032,11 @@ const STYLE = `
   .btn.answer { color: #fff; background: var(--adb-green); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); }
   .btn.danger { color: #fff; background: var(--adb-red); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); }
   .btn.danger-soft { color: var(--adb-red); }
+  .btn.door.confirm, .rbtn.door.confirm .disc { color: #1b1b1b; background: var(--warning-color, #ffa600); }
+  .btn.door.done { color: var(--adb-green); }
+  .btn.door:disabled, .rbtn.door:disabled { opacity: 0.55; cursor: default; }
+  .rbtn.door .disc { background: var(--ajax-doorbell-door-color, #3b82f6); }
+  .rbtn.door.hidden { display: none; }
   .btn.on { color: var(--text-primary-color, #fff); background: var(--primary-color, #03a9f4); }
   .btn.off { color: var(--adb-red); }
   .btn.warn { box-shadow: inset 0 0 0 2px var(--warning-color, #ffa600); }
@@ -1290,6 +1379,10 @@ const TEMPLATE = `
             ><span class="disc"><ha-icon icon="${ICONS.view}"></ha-icon></span
             ><span id="ring-view-label"></span
           ></button>
+          <button class="rbtn door hidden" id="ring-door" type="button"
+            ><span class="disc"><ha-icon id="ring-door-icon" icon="${ICONS.door}"></ha-icon></span
+            ><span id="ring-door-label"></span
+          ></button>
           <button class="rbtn answer" id="ring-answer" type="button"
             ><span class="disc"><ha-icon id="ring-answer-icon" icon="${ICONS.answer}"></ha-icon></span
             ><span id="ring-answer-label"></span
@@ -1324,7 +1417,30 @@ const EDITOR_LABELS = {
     tone_westminster: "Westminster",
     tone_digital: "Digitale",
     tone_soft: "Douce",
+    tone_three_tones: "Trois tons",
+    tone_arpeggio: "Arpège",
+    tone_xylophone: "Xylophone",
+    tone_harp: "Harpe",
+    tone_tubular: "Cloches tubulaires",
+    tone_church: "Cloche d'église",
+    tone_alert: "Alerte",
+    tone_retro: "Téléphone rétro",
+    tone_synth: "Synthé",
+    tone_sparkle: "Étincelles",
+    tone_lullaby: "Berceuse",
+    tone_marimba: "Marimba",
+    tone_echo: "Écho",
+    tone_cascade: "Cascade",
+    tone_fanfare: "Fanfare",
+    tone_zen: "Bol zen",
+    tone_bird: "Oiseau",
     test_ringtone: "Tester la sonnerie",
+    door: "Porte",
+    lock: "Serrure à ouvrir (ex. ta Nuki)",
+    lock_action: "Action du bouton",
+    lock_action_open: "Ouvrir (tirer le pêne)",
+    lock_action_unlock: "Déverrouiller",
+    lock_confirm: "Demander une confirmation",
   },
   en: {
     camera: "Doorbell camera",
@@ -1347,7 +1463,30 @@ const EDITOR_LABELS = {
     tone_westminster: "Westminster",
     tone_digital: "Digital",
     tone_soft: "Soft",
+    tone_three_tones: "Three tones",
+    tone_arpeggio: "Arpeggio",
+    tone_xylophone: "Xylophone",
+    tone_harp: "Harp",
+    tone_tubular: "Tubular bells",
+    tone_church: "Church bell",
+    tone_alert: "Alert",
+    tone_retro: "Retro phone",
+    tone_synth: "Synth",
+    tone_sparkle: "Sparkle",
+    tone_lullaby: "Lullaby",
+    tone_marimba: "Marimba",
+    tone_echo: "Echo",
+    tone_cascade: "Cascade",
+    tone_fanfare: "Fanfare",
+    tone_zen: "Zen bowl",
+    tone_bird: "Bird",
     test_ringtone: "Test the ringtone",
+    door: "Door",
+    lock: "Lock to open (e.g. your Nuki)",
+    lock_action: "Button action",
+    lock_action_open: "Open (pull the latch)",
+    lock_action_unlock: "Unlock",
+    lock_confirm: "Ask for a confirmation",
   },
 };
 
@@ -1406,6 +1545,24 @@ class AjaxDoorbellCard extends HTMLElement {
             { name: "ring_tone_url", selector: { text: {} } },
           ],
         },
+        {
+          type: "expandable",
+          name: "",
+          title: editorLabel("door"),
+          schema: [
+            { name: "lock", selector: { entity: { filter: { domain: "lock" } } } },
+            {
+              name: "lock_action",
+              selector: {
+                select: {
+                  mode: "dropdown",
+                  options: ["open", "unlock"].map((value) => ({ value, label: editorLabel(`lock_action_${value}`) })),
+                },
+              },
+            },
+            { name: "lock_confirm", selector: { boolean: {} } },
+          ],
+        },
       ],
       computeLabel: (schema) => editorLabel(schema.name),
     };
@@ -1435,6 +1592,7 @@ class AjaxDoorbellCard extends HTMLElement {
     this._visitsKey = null;
     this._thumbs = new Map(); // visit id -> signed thumbnail URL, kept while listed
     this._replay = null; // {camera, start, visitId, began, playing}
+    this._door = "idle"; // idle | confirm | sending | done
     this._replayReq = 0;
     this._ctrl = {};
     this._controlsKey = null;
@@ -1531,15 +1689,7 @@ class AjaxDoorbellCard extends HTMLElement {
       this._callSeen = EMPTY_CALL;
       this._posterLoaded = false;
     }
-    this._config = {
-      preview_on_ring: true,
-      ring_sound: false,
-      fullscreen_on_ring: false,
-      push_to_talk: false,
-      show_stats: false,
-      auto_retry: true,
-      ...config,
-    };
+    this._config = { ...CARD_DEFAULTS, ...config };
     this._ceCache = null;
     this._caps = undefined;
     this._capsFor = null;
@@ -2014,6 +2164,78 @@ class AjaxDoorbellCard extends HTMLElement {
     }
     debug("answering from the URL (ajax_answer=%s)", value);
     this._answer();
+  }
+
+  /* ---------- door (any lock entity: a Nuki opens with lock.open) ---------- */
+
+  _lockState() {
+    const lock = this._config && this._config.lock;
+    return (lock && this._hass && this._hass.states[lock]) || null;
+  }
+
+  /** First press asks to confirm (unless disabled), the second opens. */
+  _doorPress() {
+    const st = this._lockState();
+    if (!st || st.state === "unavailable" || this._door === "sending") return;
+    if (this._config.lock_confirm !== false && this._door !== "confirm") {
+      this._door = "confirm";
+      this._setTimeout("door", () => this._setDoor("idle"), DOOR_CONFIRM_MS);
+      this._refreshDoor();
+      return;
+    }
+    this._clearTimer("door");
+    this._setDoor("sending");
+    const supportsOpen = Number(st.attributes && st.attributes.supported_features) & 1;
+    const action = this._config.lock_action || (supportsOpen ? "open" : "unlock");
+    debug("door:", `lock.${action}`, st.entity_id);
+    Promise.resolve()
+      .then(() => this._hass.callService("lock", action, { entity_id: st.entity_id }))
+      .then(
+        () => {
+          this._setDoor("done");
+          this._flash(this._t("door_open"));
+          this._setTimeout("door", () => this._setDoor("idle"), 6000);
+        },
+        (err) => {
+          this._setDoor("idle");
+          this._flash(this._t("door_failed", { message: (err && (err.message || err.code)) || err }));
+        }
+      );
+  }
+
+  _setDoor(phase) {
+    this._door = phase;
+    this._refreshDoor();
+  }
+
+  /** The door buttons follow the press and the lock's own state. */
+  _refreshDoor() {
+    const els = this._els;
+    const button = this._ctrl && this._ctrl.door;
+    const st = this._lockState();
+    const lockState = st ? st.state : "unavailable";
+    const opened = this._door === "done" || lockState === "open" || lockState === "opening";
+    const phase =
+      this._door === "confirm" ? "confirm" : this._door === "sending" || lockState === "unlocking" ? "sending" : opened ? "done" : "idle";
+    const label = this._t(
+      phase === "confirm" ? "door_confirm" : phase === "sending" ? "door_opening" : phase === "done" ? "door_opened" : "open_door"
+    );
+    const icon = phase === "done" ? ICONS.doorDone : ICONS.door;
+    const disabled = !st || lockState === "unavailable" || phase === "sending";
+    if (button) {
+      setText(button._label, label);
+      setAttr(button._icon, "icon", icon);
+      button.classList.toggle("confirm", phase === "confirm");
+      button.classList.toggle("done", phase === "done");
+      button.classList.toggle("busy", phase === "sending");
+      button.disabled = disabled;
+    }
+    if (els.ringDoor) {
+      setClass(els.ringDoor, `rbtn door${this._config.lock ? "" : " hidden"}${phase === "confirm" ? " confirm" : ""}`);
+      setText(els.ringDoorLabel, label);
+      setAttr(els.ringDoorIcon, "icon", icon);
+      els.ringDoor.disabled = disabled;
+    }
   }
 
   /* ---------- recent visits, replayed from the NVR ---------- */
@@ -2944,17 +3166,24 @@ class AjaxDoorbellCard extends HTMLElement {
       return;
     }
     const tone = RING_TONES[this._config.ring_tone] || RING_TONES.chime;
-    tone.notes.forEach(([frequency, offset, length]) => this._bell(ctx, master, frequency, start + offset, length, tone.voice));
+    tone.notes.forEach(([frequency, offset, length, gain, glide]) =>
+      this._bell(ctx, master, frequency, start + offset, length, tone.voice, gain, glide)
+    );
   }
 
-  _bell(ctx, destination, frequency, start, duration, voiceName = "bell") {
+  _bell(ctx, destination, frequency, start, duration, voiceName = "bell", level = 1, glide = 0) {
     const voice = VOICES[voiceName] || VOICES.bell;
-    voice.partials.forEach(([ratio, gain]) => {
+    voice.partials.forEach(([ratio, partialGain]) => {
       const osc = ctx.createOscillator();
       const env = ctx.createGain();
       const end = start + duration / Math.sqrt(ratio);
+      const gain = Math.max(0.0002, partialGain * (level || 1));
       osc.type = voice.type;
       osc.frequency.value = frequency * ratio;
+      if (glide) {
+        osc.frequency.setValueAtTime(frequency * ratio, start);
+        osc.frequency.exponentialRampToValueAtTime(glide * ratio, start + duration * 0.8);
+      }
       env.gain.setValueAtTime(0.0001, start);
       env.gain.exponentialRampToValueAtTime(gain, start + voice.attack);
       env.gain.exponentialRampToValueAtTime(0.0001, end);
@@ -3283,6 +3512,9 @@ class AjaxDoorbellCard extends HTMLElement {
       ringView: $("ring-view"),
       ringViewLabel: $("ring-view-label"),
       ringIgnore: $("ring-ignore"),
+      ringDoor: $("ring-door"),
+      ringDoorIcon: $("ring-door-icon"),
+      ringDoorLabel: $("ring-door-label"),
       ringIgnoreLabel: $("ring-ignore-label"),
       announcer: $("announcer"),
     };
@@ -3307,6 +3539,7 @@ class AjaxDoorbellCard extends HTMLElement {
     this._els.ringAnswer.addEventListener("click", () => this._answer());
     this._els.ringView.addEventListener("click", () => this._view());
     this._els.ringIgnore.addEventListener("click", () => this._dismiss());
+    this._els.ringDoor.addEventListener("click", () => this._doorPress());
     this._built = true;
     this._applyAspect();
     this._refreshPoster(true);
@@ -3391,6 +3624,7 @@ class AjaxDoorbellCard extends HTMLElement {
       talk ? "talk" : "listen",
       this._config.push_to_talk ? "ptt" : "toggle",
       screen === "view" && ringing ? "ringing" : "",
+      this._config.lock || "",
       this._lang(),
     ].join("|");
     if (key !== this._controlsKey) {
@@ -3483,11 +3717,17 @@ class AjaxDoorbellCard extends HTMLElement {
         onClick: () => this._toggleFullscreen(),
       });
     const errored = this._media === "error";
+    const doorButton = () => {
+      if (!this._config.lock) return;
+      const button = add("door", { icon: ICONS.door, label: this._t("open_door"), cls: "door", onClick: () => this._doorPress() });
+      setAttr(button, "title", this._t("open_door_title"));
+    };
 
     if (screen === "missing") return;
     if (screen === "idle") {
       add("view", { icon: ICONS.view, label: this._t("view"), cls: "wide", onClick: () => this._view() });
       answerButton();
+      doorButton();
       return;
     }
     if (screen === "replay") {
@@ -3510,6 +3750,7 @@ class AjaxDoorbellCard extends HTMLElement {
           add("ignore", { icon: ICONS.ignore, label: this._t("ignore"), cls: "danger-soft", onClick: () => this._dismiss() });
         }
       }
+      doorButton();
       add("close", { icon: ICONS.close, label: this._t("close"), onClick: () => this._close() });
       return;
     }
@@ -3520,6 +3761,7 @@ class AjaxDoorbellCard extends HTMLElement {
       speakerButton();
       fullscreenButton();
     }
+    doorButton();
     add("hangup", { icon: ICONS.hangup, label: this._t("hang_up"), cls: "danger wide", onClick: () => this._hangUp() });
   }
 
@@ -3584,6 +3826,7 @@ class AjaxDoorbellCard extends HTMLElement {
 
   _refreshControls() {
     const c = this._ctrl;
+    this._refreshDoor();
     if (c.mic) {
       const on = this._micWanted && Boolean(this._micTrack || this._micBusy);
       setAttr(c.mic._icon, "icon", on ? ICONS.mic : ICONS.micOff);
@@ -3754,7 +3997,8 @@ class AjaxDoorbellCardEditor extends HTMLElement {
       this._form = form;
     }
     this._form.hass = this._hass;
-    this._form.data = this._config;
+    // Show the defaults as they apply, not as switched off.
+    this._form.data = { ...CARD_DEFAULTS, ...this._config };
   }
 
   /** Play one ring with the settings being edited (a click: audio may start). */
