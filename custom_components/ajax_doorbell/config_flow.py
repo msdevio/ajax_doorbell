@@ -56,6 +56,10 @@ PASSWORD = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
 PORT = vol.All(vol.Coerce(int), vol.Range(min=1, max=65535))
 
 
+class NvrAddressError(Exception):
+    """The address is the NVR's: it belongs in the DoorBell's options."""
+
+
 class NoProfilesError(Exception):
     """The device answers ONVIF but exposes no video."""
 
@@ -76,11 +80,14 @@ async def async_probe(
     client = AjaxOnvifClient(async_get_clientsession(hass), host, port, username, password)
     await client.async_update_time_offset()
     try:
-        await client.async_get_services()
+        services = await client.async_get_services()
     except OnvifAuthError:
         raise
     except OnvifError as err:
         _LOGGER.debug("GetServices failed (%s), using default paths", err)
+    else:
+        if {"search", "replay"} <= services.keys():
+            raise NvrAddressError
     identity = await client.async_get_identity()
     profiles = await client.async_get_profiles()
     if not profiles:
@@ -140,6 +147,8 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
             return None, {"base": "invalid_auth"}
         except NoProfilesError:
             return None, {"base": "no_profiles"}
+        except NvrAddressError:
+            return None, {"base": "is_nvr"}
         except OnvifError as err:
             _LOGGER.debug("Cannot reach %s: %s", user_input[CONF_HOST], err)
             return None, {"base": "cannot_connect"}

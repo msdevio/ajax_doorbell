@@ -36,7 +36,8 @@
     "error": {
       "cannot_connect": "Cannot reach the device. Check the address and that ONVIF is enabled in the Ajax app.",
       "invalid_auth": "The device refused this ONVIF account.",
-      "no_profiles": "The device answers ONVIF but shares no video stream with this account."
+      "no_profiles": "The device answers ONVIF but shares no video stream with this account.",
+      "is_nvr": "This is the Ajax NVR's address. Add the DoorBell itself here, then enter the NVR's address in the DoorBell's options (Configure)."
     },
     "abort": {
       "already_configured": "This DoorBell is already set up.",

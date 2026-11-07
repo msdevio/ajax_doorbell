@@ -36,7 +36,8 @@
     "error": {
       "cannot_connect": "Appareil injoignable. Vérifie l'adresse et que l'ONVIF est activé dans l'app Ajax.",
       "invalid_auth": "L'appareil refuse ce compte ONVIF.",
-      "no_profiles": "L'appareil répond en ONVIF mais ne partage aucun flux vidéo avec ce compte."
+      "no_profiles": "L'appareil répond en ONVIF mais ne partage aucun flux vidéo avec ce compte.",
+      "is_nvr": "C'est l'adresse du NVR Ajax. Ajoute ici la DoorBell elle-même, puis indique l'adresse du NVR dans ses options (Configurer)."
     },
     "abort": {
       "already_configured": "Cette DoorBell est déjà configurée.",

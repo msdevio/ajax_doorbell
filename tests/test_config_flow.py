@@ -232,3 +232,14 @@ async def test_options_nvr_refuses_the_account(
         },
     )
     assert result["errors"] == {"base": "nvr_invalid_auth"}
+
+
+async def test_user_refuses_the_nvr(hass: HomeAssistant, mock_client: MagicMock) -> None:
+    """The NVR's address is refused: it goes in the DoorBell's options."""
+    mock_client.async_get_services.return_value = {"device": "d", "search": "s", "replay": "r"}
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**ENTRY_DATA, CONF_HOST: "192.168.128.30"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "is_nvr"}
