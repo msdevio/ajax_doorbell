@@ -96,6 +96,36 @@ DoorBell.
 `config_entry_id`, plus `answered_by`, `after_ring`, `during_call` ou `reason` selon
 le cas.
 
+## Carte interphone
+
+1. Copie `card/ajax-doorbell-card.js` dans ton dossier `config/www/`.
+2. **Paramètres → Tableaux de bord → ⋮ → Ressources → Ajouter une ressource** :
+   `/local/ajax-doorbell-card.js`, type **Module JavaScript**.
+3. Ajoute la carte à une vue (une vue « Interphone » dédiée est idéale) :
+
+```yaml
+type: custom:ajax-doorbell-card
+camera: camera.ajax_doorbell             # obligatoire
+call_entity: sensor.ajax_doorbell_appel  # facultatif, trouvé sur l'appareil de la caméra
+name: Entrée                             # par défaut : le nom de la caméra
+answered_by: Tablette de l'entrée        # par défaut : "<utilisateur> (téléphone|tablette|ordinateur)"
+two_way_audio: true                      # true force la parole, false l'écoute seule
+push_to_talk: false                      # maintenir le bouton pour parler
+preview_on_ring: true                    # lance la vidéo en muet dès la sonnerie
+ring_sound: false                        # sonnerie dans le navigateur
+fullscreen_on_ring: false
+show_stats: false                        # RTT, gigue, résolution, codecs
+auto_retry: true
+aspect_ratio: "16 / 9"
+```
+
+Quand ça sonne, la carte affiche un écran d'appel entrant avec **Décrocher**,
+**Voir** et **Ignorer**. **Voir** puis **Décrocher** garde la même connexion : seul
+le micro s'ajoute. Décrocher sur un écran affiche « Décroché sur … » sur les autres.
+Ouvrir la vue avec `?ajax_answer=1` (ou `?ajax_answer=camera.ajax_doorbell` s'il y a
+plusieurs sonnettes) décroche aussitôt : c'est ce qu'utilise le bouton de la
+notification.
+
 ## Notification avec bouton Décrocher
 
 Importe le blueprint

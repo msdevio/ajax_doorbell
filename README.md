@@ -87,6 +87,35 @@ Target a DoorBell entity or device; without a target the service acts on every D
 `config_entry_id`, plus `answered_by`, `after_ring`, `during_call` or `reason` when
 relevant.
 
+## Intercom card
+
+1. Copy `card/ajax-doorbell-card.js` to your `config/www/` folder.
+2. **Settings → Dashboards → ⋮ → Resources → Add resource**:
+   `/local/ajax-doorbell-card.js`, type **JavaScript module**.
+3. Add the card to a view (a dedicated "Intercom" view works best):
+
+```yaml
+type: custom:ajax-doorbell-card
+camera: camera.ajax_doorbell             # required
+call_entity: sensor.ajax_doorbell_call   # optional, found on the camera's device
+name: Front door                         # default: the camera's name
+answered_by: Hall tablet                 # default: "<user> (phone|tablet|computer)"
+two_way_audio: true                      # true forces talk-back, false listen only
+push_to_talk: false                      # hold the button to talk
+preview_on_ring: true                    # start the video muted as soon as it rings
+ring_sound: false                        # ringtone in the browser
+fullscreen_on_ring: false
+show_stats: false                        # RTT, jitter, resolution, codecs
+auto_retry: true
+aspect_ratio: "16 / 9"
+```
+
+When it rings the card shows an incoming-call screen with **Answer**, **View** and
+**Ignore**. **View** then **Answer** keeps the same connection: only the microphone
+is added. Answering on one screen shows "Answered on …" on the others. Opening the
+view with `?ajax_answer=1` (or `?ajax_answer=camera.ajax_doorbell` when there are
+several doorbells) answers at once: that is what the notification button uses.
+
 ## Notification with an Answer button
 
 Import the blueprint
