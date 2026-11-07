@@ -126,6 +126,9 @@ two_way_audio: true                      # true force la parole, false l'écoute
 push_to_talk: false                      # maintenir le bouton pour parler
 preview_on_ring: true                    # lance la vidéo en muet dès la sonnerie
 ring_sound: false                        # sonnerie dans le navigateur
+ring_tone: chime                         # chime, classic, westminster, digital ou soft
+ring_volume: 55                          # de 0 à 100
+ring_tone_url: /local/sonnerie.mp3       # facultatif : ton fichier dans config/www/
 fullscreen_on_ring: false
 show_stats: false                        # RTT, gigue, résolution, codecs
 auto_retry: true

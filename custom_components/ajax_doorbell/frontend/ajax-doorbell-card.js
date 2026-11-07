@@ -34,7 +34,7 @@
  * it the card still shows the video and plays the sound.
  */
 
-const CARD_VERSION = "0.2.0";
+const CARD_VERSION = "0.2.3";
 const DOMAIN = "ajax_doorbell";
 
 const KEEPALIVE_MS = 60000; // re-answer during our call: the integration ends unattended calls
@@ -47,6 +47,24 @@ const STABLE_MS = 30000; // a connection up this long earns a new automatic retr
 const STATS_MS = 2000;
 const FLASH_MS = 3500;
 const RING_REPEAT_MS = 3000;
+// Built-in ringtones: notes as [frequency Hz, start s, length s], played by a voice.
+const RING_TONES = {
+  chime: { voice: "bell", notes: [[659.25, 0, 1.2], [523.25, 0.55, 1.7]] },
+  classic: { voice: "bell", notes: [[783.99, 0, 1.1], [622.25, 0.65, 1.9]] },
+  westminster: {
+    voice: "bell",
+    repeat: 4500,
+    notes: [[659.25, 0, 0.9], [523.25, 0.55, 0.9], [587.33, 1.1, 0.9], [392.0, 1.65, 2.2]],
+  },
+  digital: { voice: "beep", repeat: 2000, notes: [[1046.5, 0, 0.12], [1046.5, 0.2, 0.12], [1046.5, 0.4, 0.12]] },
+  soft: { voice: "soft", repeat: 3500, notes: [[523.25, 0, 1.4], [659.25, 0.3, 1.4], [783.99, 0.6, 1.9]] },
+};
+const VOICES = {
+  // A few inharmonic partials with fast decays sound like a chime, not a beep.
+  bell: { type: "sine", attack: 0.012, partials: [[1, 0.6], [2.76, 0.14], [5.4, 0.05]] },
+  beep: { type: "square", attack: 0.005, partials: [[1, 0.12]] },
+  soft: { type: "sine", attack: 0.06, partials: [[1, 0.5], [3.99, 0.04]] },
+};
 const FS_FALLBACK_MS = 1000;
 const TALK_READY_MS = 8000;
 const REPLAY_LEAD_MS = 5000; // a visit is replayed from a little before it started
@@ -1297,6 +1315,15 @@ const EDITOR_LABELS = {
     auto_retry: "Reconnexion automatique",
     aspect_ratio: "Format de l'image (ex. 16 / 9)",
     options: "Options",
+    ringtone: "Sonnerie",
+    ring_tone: "Son de la sonnerie (joué à chaque choix)",
+    ring_volume: "Volume de la sonnerie",
+    ring_tone_url: "Ou ton fichier (ex. /local/sonnerie.mp3)",
+    tone_chime: "Carillon",
+    tone_classic: "Classique",
+    tone_westminster: "Westminster",
+    tone_digital: "Digitale",
+    tone_soft: "Douce",
   },
   en: {
     camera: "Doorbell camera",
@@ -1310,6 +1337,15 @@ const EDITOR_LABELS = {
     auto_retry: "Reconnect automatically",
     aspect_ratio: "Picture shape (e.g. 16 / 9)",
     options: "Options",
+    ringtone: "Ringtone",
+    ring_tone: "Ringtone sound (played when chosen)",
+    ring_volume: "Ringtone volume",
+    ring_tone_url: "Or your own file (e.g. /local/ringtone.mp3)",
+    tone_chime: "Chime",
+    tone_classic: "Classic",
+    tone_westminster: "Westminster",
+    tone_digital: "Digital",
+    tone_soft: "Soft",
   },
 };
 
@@ -1344,6 +1380,24 @@ class AjaxDoorbellCard extends HTMLElement {
               schema: ["preview_on_ring", "ring_sound", "fullscreen_on_ring", "push_to_talk", "show_stats", "auto_retry"].map(toggle),
             },
             { name: "aspect_ratio", selector: { text: {} } },
+          ],
+        },
+        {
+          type: "expandable",
+          name: "",
+          title: editorLabel("ringtone"),
+          schema: [
+            {
+              name: "ring_tone",
+              selector: {
+                select: {
+                  mode: "dropdown",
+                  options: Object.keys(RING_TONES).map((value) => ({ value, label: editorLabel(`tone_${value}`) })),
+                },
+              },
+            },
+            { name: "ring_volume", selector: { number: { min: 0, max: 100, step: 5, mode: "slider", unit_of_measurement: "%" } } },
+            { name: "ring_tone_url", selector: { text: {} } },
           ],
         },
       ],
@@ -1459,6 +1513,10 @@ class AjaxDoorbellCard extends HTMLElement {
       throw new Error("ajax-doorbell-card: set 'camera' to a camera entity (camera.xxx)");
     }
     const previous = this._config;
+    const toneChanged =
+      previous &&
+      ["ring_tone", "ring_volume", "ring_tone_url"].some((key) => previous[key] !== config[key]);
+    if (toneChanged && this._isPreview) this._setTimeout("tone_preview", () => this._previewRingtone(), 400);
     if (previous && (previous.camera !== config.camera || previous.call_entity !== config.call_entity)) {
       // Another doorbell: end what runs on the old one while the old config is still in place.
       if (this._ownCall) this._hangUp();
@@ -2795,50 +2853,104 @@ class AjaxDoorbellCard extends HTMLElement {
     const ctx = this._getAudioCtx();
     if (!ctx) return;
     const master = ctx.createGain();
-    master.gain.value = 0.55;
+    master.gain.value = this._ringVolume();
     master.connect(ctx.destination);
     const ringtone = { ctx, master, timer: null, unlock: null, last: -Infinity };
     this._ringtone = ringtone;
-    const chime = () => {
+    const play = () => {
       if (this._ringtone !== ringtone || ctx.state !== "running") return;
       if (ctx.currentTime - ringtone.last < 1) return;
       ringtone.last = ctx.currentTime;
-      const t0 = ctx.currentTime + 0.03;
-      this._bell(ctx, master, 659.25, t0, 1.2); // E5: "ding"
-      this._bell(ctx, master, 523.25, t0 + 0.55, 1.7); // C5: "dong"
+      this._playTone(ctx, master, ctx.currentTime + 0.03);
     };
-    ringtone.timer = setInterval(chime, RING_REPEAT_MS);
-    if (ctx.state === "running") {
-      chime();
-      return;
-    }
-    // Browsers keep audio suspended until the user has interacted with the page.
-    Promise.resolve()
-      .then(() => ctx.resume())
-      .then(chime, () => {});
-    ringtone.unlock = () => {
+    this._toneRepeat().then((every) => {
+      if (this._ringtone !== ringtone) return;
+      ringtone.timer = setInterval(play, every);
+      if (ctx.state === "running") {
+        play();
+        return;
+      }
+      // Browsers keep audio suspended until the user has interacted with the page.
       Promise.resolve()
         .then(() => ctx.resume())
-        .then(chime, () => {});
-    };
-    window.addEventListener("pointerdown", ringtone.unlock, true);
-    window.addEventListener("keydown", ringtone.unlock, true);
+        .then(play, () => {});
+      ringtone.unlock = () => {
+        Promise.resolve()
+          .then(() => ctx.resume())
+          .then(play, () => {});
+      };
+      window.addEventListener("pointerdown", ringtone.unlock, true);
+      window.addEventListener("keydown", ringtone.unlock, true);
+    });
   }
 
-  _bell(ctx, destination, frequency, start, duration) {
-    // A few inharmonic partials with fast decays sound like a chime, not a beep.
-    [
-      [1, 0.6],
-      [2.76, 0.14],
-      [5.4, 0.05],
-    ].forEach(([ratio, gain]) => {
+  /** One ring of the chosen tone, so the editor lets you hear it. */
+  _previewRingtone() {
+    const ctx = this._getAudioCtx();
+    if (!ctx) return;
+    const master = ctx.createGain();
+    master.gain.value = this._ringVolume();
+    master.connect(ctx.destination);
+    Promise.resolve()
+      .then(() => ctx.resume())
+      .then(() => this._toneRepeat())
+      .then(() => this._playTone(ctx, master, ctx.currentTime + 0.03))
+      .catch(() => {});
+  }
+
+  _ringVolume() {
+    const volume = Number(this._config && this._config.ring_volume);
+    return Number.isFinite(volume) && volume >= 0 ? Math.min(volume, 100) / 100 : 0.55;
+  }
+
+  /** Load the custom ringtone file, if any; resolves with the repeat interval. */
+  async _toneRepeat() {
+    const url = this._config && this._config.ring_tone_url;
+    if (url && this._toneFile && this._toneFile.url === url) {
+      return Math.max(RING_REPEAT_MS, (this._toneFile.buffer ? this._toneFile.buffer.duration * 1000 : 0) + 500);
+    }
+    if (url) {
+      const file = { url, buffer: null };
+      this._toneFile = file;
+      try {
+        const ctx = this._getAudioCtx();
+        const href = url.startsWith("/") && this._hass && this._hass.hassUrl ? this._hass.hassUrl(url) : url;
+        const response = await fetch(href, { credentials: "same-origin" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.arrayBuffer();
+        file.buffer = await new Promise((resolve, reject) => ctx.decodeAudioData(data, resolve, reject));
+      } catch (err) {
+        debug("ringtone file unavailable, using the built-in tone:", (err && err.message) || err);
+      }
+      return this._toneRepeat();
+    }
+    const tone = RING_TONES[this._config && this._config.ring_tone] || RING_TONES.chime;
+    return tone.repeat || RING_REPEAT_MS;
+  }
+
+  _playTone(ctx, master, start) {
+    const file = this._toneFile;
+    if (this._config.ring_tone_url && file && file.url === this._config.ring_tone_url && file.buffer) {
+      const source = ctx.createBufferSource();
+      source.buffer = file.buffer;
+      source.connect(master);
+      source.start(start);
+      return;
+    }
+    const tone = RING_TONES[this._config.ring_tone] || RING_TONES.chime;
+    tone.notes.forEach(([frequency, offset, length]) => this._bell(ctx, master, frequency, start + offset, length, tone.voice));
+  }
+
+  _bell(ctx, destination, frequency, start, duration, voiceName = "bell") {
+    const voice = VOICES[voiceName] || VOICES.bell;
+    voice.partials.forEach(([ratio, gain]) => {
       const osc = ctx.createOscillator();
       const env = ctx.createGain();
       const end = start + duration / Math.sqrt(ratio);
-      osc.type = "sine";
+      osc.type = voice.type;
       osc.frequency.value = frequency * ratio;
       env.gain.setValueAtTime(0.0001, start);
-      env.gain.exponentialRampToValueAtTime(gain, start + 0.012);
+      env.gain.exponentialRampToValueAtTime(gain, start + voice.attack);
       env.gain.exponentialRampToValueAtTime(0.0001, end);
       osc.connect(env);
       env.connect(destination);
