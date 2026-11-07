@@ -34,7 +34,7 @@
  * it the card still shows the video and plays the sound.
  */
 
-const CARD_VERSION = "0.2.5";
+const CARD_VERSION = "0.2.6";
 const DOMAIN = "ajax_doorbell";
 
 const KEEPALIVE_MS = 60000; // re-answer during our call: the integration ends unattended calls
@@ -453,6 +453,9 @@ const STRINGS = {
     st_audio_in: "Son reçu",
     st_audio_out: "Micro",
     st_off: "coupé",
+    st_level: "niveau",
+    st_muted: "son coupé",
+    st_relay: "relais",
   },
   en: {
     view: "View",
@@ -532,6 +535,9 @@ const STRINGS = {
     st_audio_in: "Audio in",
     st_audio_out: "Mic",
     st_off: "off",
+    st_level: "level",
+    st_muted: "muted",
+    st_relay: "relay",
   },
 };
 
@@ -3444,18 +3450,29 @@ class AjaxDoorbellCard extends HTMLElement {
     const lost = ((videoIn && videoIn.packetsLost) || 0) + ((audioIn && audioIn.packetsLost) || 0);
     const received = ((videoIn && videoIn.packetsReceived) || 0) + ((audioIn && audioIn.packetsReceived) || 0);
     const bytes = (videoIn && videoIn.bytesReceived) || 0;
+    const audioBytes = (audioIn && audioIn.bytesReceived) || 0;
     const now = Date.now();
     const prev = this._statsPrev;
     let loss = "—";
     let rate = "";
+    let audioRate = "";
     if (prev) {
       const dLost = Math.max(0, lost - prev.lost);
       const dReceived = Math.max(0, received - prev.received);
       loss = `${(dLost + dReceived > 0 ? (dLost / (dLost + dReceived)) * 100 : 0).toFixed(1)} %`;
       const seconds = (now - prev.time) / 1000;
       if (seconds > 0 && bytes >= prev.bytes) rate = ` · ${Math.round(((bytes - prev.bytes) * 8) / seconds / 1000)} kb/s`;
+      if (seconds > 0 && audioBytes >= prev.audioBytes) {
+        audioRate = ` · ${Math.round(((audioBytes - prev.audioBytes) * 8) / seconds / 1000)} kb/s`;
+      }
     }
-    this._statsPrev = { time: now, lost, received, bytes };
+    this._statsPrev = { time: now, lost, received, bytes, audioBytes };
+    // How loud the visitor arrives: tells "no sound sent" from "sound not played".
+    const level =
+      audioIn && typeof audioIn.audioLevel === "number"
+        ? ` · ${this._t("st_level")} ${audioIn.audioLevel > 0 ? `${Math.round(20 * Math.log10(audioIn.audioLevel))} dB` : "—"}`
+        : "";
+    const muted = this._els.video && this._els.video.muted ? ` (${this._t("st_muted")})` : "";
 
     const size = videoIn && videoIn.frameWidth ? `${videoIn.frameWidth}×${videoIn.frameHeight}` : "—";
     const fps =
@@ -3465,8 +3482,10 @@ class AjaxDoorbellCard extends HTMLElement {
       `${this._t("st_jitter")} ${ms(audioIn && audioIn.jitter)} (A) · ${ms(videoIn && videoIn.jitter)} (V)`,
       `${this._t("st_loss")} ${loss}`,
       `${this._t("st_video")} ${size}${fps} · ${codec(videoIn)}${rate}`,
-      `${this._t("st_audio_in")} ${codec(audioIn)}`,
-      `${this._t("st_audio_out")} ${audioOut ? codec(audioOut) : "—"}${this._micLive ? "" : ` (${this._t("st_off")})`}`,
+      `${this._t("st_audio_in")} ${codec(audioIn)}${audioRate}${level}${muted}`,
+      `${this._t("st_audio_out")} ${
+        this._relay && this._relay.ready ? `${this._relay.codec} (${this._t("st_relay")})` : audioOut ? codec(audioOut) : "—"
+      }${this._micLive ? "" : ` (${this._t("st_off")})`}`,
     ];
     setText(this._els.stats, lines.join("\n"));
   }

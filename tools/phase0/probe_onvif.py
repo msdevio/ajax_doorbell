@@ -37,6 +37,7 @@ import time
 import urllib.error
 from urllib.parse import urlsplit
 import urllib.request
+import wave
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
@@ -531,6 +532,49 @@ class G722Encoder:
         return bytes(out)
 
 
+_QM6 = (-136, -136, -136, -136, -24808, -21904, -19008, -16704, -14984, -13512, -12280, -11192,
+        -10232, -9360, -8576, -7856, -7192, -6576, -6000, -5456, -4944, -4464, -4008, -3576,
+        -3168, -2776, -2400, -2032, -1688, -1360, -1040, -728, 24808, 21904, 19008, 16704,
+        14984, 13512, 12280, 11192, 10232, 9360, 8576, 7856, 7192, 6576, 6000, 5456,
+        4944, 4464, 4008, 3576, 3168, 2776, 2400, 2032, 1688, 1360, 1040, 728,
+        432, 136, -432, -136)  # fmt: skip
+
+
+class G722Decoder:
+    """ITU-T G.722 at 64 kbit/s: one byte in, two 16 kHz samples out (as FFmpeg)."""
+
+    def __init__(self) -> None:
+        self._x = [0] * 24
+        self._low, self._high = _Band(32), _Band(8)
+
+    def decode(self, data: bytes) -> list[int]:
+        out: list[int] = []
+        x, low, high = self._x, self._low, self._high
+        for code in data:
+            ilow, ihigh = code & 0x3F, (code >> 6) & 0x03
+            rlow = max(-16384, min(16383, low.s + ((low.det * _QM6[ilow]) >> 15)))
+            ril = ilow >> 2
+            dlowt = (low.det * _QM4[ril]) >> 15
+            low.nb = max(0, min(18432, ((low.nb * 127) >> 7) + _WL[_RL42[ril]]))
+            shift, base = 8 - (low.nb >> 11), _ILB[(low.nb >> 6) & 31]
+            low.det = (base << -shift if shift < 0 else base >> shift) << 2
+            low.update(dlowt)
+
+            dhigh = (high.det * _QM2[ihigh]) >> 15
+            rhigh = max(-16384, min(16383, dhigh + high.s))
+            high.nb = max(0, min(22528, ((high.nb * 127) >> 7) + _WH[_RH2[ihigh]]))
+            shift, base = 10 - (high.nb >> 11), _ILB[(high.nb >> 6) & 31]
+            high.det = (base << -shift if shift < 0 else base >> shift) << 2
+            high.update(dhigh)
+
+            del x[:2]
+            x += (rlow + rhigh, rlow - rhigh)
+            xout2 = sum(x[2 * i] * _QMF[i] for i in range(12))
+            xout1 = sum(x[2 * i + 1] * _QMF[11 - i] for i in range(12))
+            out += (_sat(xout1 >> 11), _sat(xout2 >> 11))
+        return out
+
+
 # ----------------------------------------------------------------------- report
 
 
@@ -577,6 +621,7 @@ class Findings:
     profile_g: str = "no"
     replay: str = "not tried"
     beep: str = "not run"
+    listen: str = "not run"
     errors: list[str] = field(default_factory=list)
 
 
@@ -1328,6 +1373,91 @@ def search_results(cam: Onvif, call: str, token: str, item: str) -> list[ET.Elem
     return found
 
 
+def step_listen(args, f: Findings, uri: str, seconds: int) -> None:
+    """Record the doorbell microphone straight from the DoorBell, as a WAV file."""
+    section(f"Listening test: {seconds} s of the doorbell microphone")
+    rtsp = Rtsp(args.host, args.rtsp_port, args.user, args.password)
+    try:
+        resp = rtsp.request("DESCRIBE", uri, {"Accept": "application/sdp"})
+        base = resp.headers.get("content-base", uri)
+        audio = next(
+            (m for m in parse_sdp(resp.body.decode(errors="replace")) if m.kind == "audio"), None
+        )
+        if audio is None or not audio.payloads:
+            f.listen = "no audio track"
+            print(f.listen)
+            return
+        codec = audio.payloads[0].split(" ", 1)[1].split("/")[0].upper()
+        setup = rtsp.request(
+            "SETUP",
+            media_url(base, audio.control),
+            {"Transport": "RTP/AVP/TCP;unicast;interleaved=0-1"},
+        )
+        if setup.status != 200:
+            f.listen = f"SETUP refused ({setup.status})"
+            return
+        assigned = re.search(r"interleaved=(\d+)", setup.headers.get("transport", ""))
+        audio_channel = int(assigned.group(1)) if assigned else 0
+        print(
+            f"\a\n>>> Fais du bruit devant la sonnette pendant {seconds} s "
+            "(parle, ou pose ton téléphone qui joue de la musique devant).\n"
+        )
+        started = time.monotonic()
+        rtsp.request("PLAY", base, {"Range": "npt=0.000-"})
+        payload = bytearray()
+        for channel, packet, _ in rtsp.read_interleaved(started + seconds):
+            if channel != audio_channel or len(packet) < 12:
+                continue
+            header = 12 + 4 * (packet[0] & 0x0F)
+            if packet[0] & 0x10 and len(packet) >= header + 4:
+                header += 4 + 4 * int.from_bytes(packet[header + 2 : header + 4], "big")
+            payload += packet[header:]
+        with suppress(OSError):
+            rtsp.request("TEARDOWN", base)
+    finally:
+        rtsp.close()
+    if codec == "G722":
+        samples, rate = G722Decoder().decode(bytes(payload)), 16000
+    elif codec in ("PCMA", "PCMU"):
+        samples, rate = [_g711(b, codec) for b in payload], 8000
+    else:
+        f.listen = f"{codec}: not decoded by this probe"
+        print(f.listen)
+        return
+    levels = []
+    for i in range(0, len(samples), rate):
+        second = samples[i : i + rate]
+        rms = math.sqrt(sum(v * v for v in second) / max(len(second), 1))
+        levels.append(20 * math.log10(rms / 32768) if rms else -120.0)
+    print("level per second (dBFS): " + " ".join(f"{level:.0f}" for level in levels))
+    path = os.path.join(
+        os.path.dirname(args.report or ".") or ".", f"ecoute-{time.strftime('%Y%m%d-%H%M%S')}.wav"
+    )
+    with wave.open(path, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+    loud = max(levels, default=-120.0)
+    f.listen = (
+        f"{len(payload)} bytes of {codec}, loudest second {loud:.0f} dBFS, "
+        f"quietest {min(levels, default=-120.0):.0f} dBFS; recording: {path}"
+    )
+    print(f"\a>>> Enregistrement terminé : {path} (écoute-le).")
+
+
+def _g711(byte: int, codec: str) -> int:
+    if codec == "PCMU":
+        byte = ~byte & 0xFF
+        sign, exponent, mantissa = byte & 0x80, (byte >> 4) & 0x07, byte & 0x0F
+        value = (((mantissa << 3) + 0x84) << exponent) - 0x84
+        return -value if sign else value
+    byte ^= 0x55
+    sign, exponent, mantissa = byte & 0x80, (byte >> 4) & 0x07, byte & 0x0F
+    value = (mantissa << 4) + 8 if exponent == 0 else ((mantissa << 4) + 0x108) << (exponent - 1)
+    return value if sign else -value
+
+
 def step_nvr(cam: Onvif, args, f: Findings) -> None:
     section("NVR recordings (Profile G)")
     if "search" not in cam.xaddr:
@@ -1519,6 +1649,12 @@ def run(args) -> Findings:
         except (OnvifError, OSError, ET.ParseError) as err:
             f.errors.append(f"events: {err}")
             print(f"!! events: {err}")
+    if args.listen and uris:
+        try:
+            step_listen(args, f, uris[0], args.listen)
+        except OSError as err:
+            f.errors.append(f"listen: {err}")
+            print(f"!! listen: {err}")
     if args.beep and uris:
         if not f.rang:
             print("\a\n>>> Bips dans 30 s : va devant la porte pour les écouter.\n")
@@ -1551,8 +1687,13 @@ def main() -> int:
         "--beep", action="store_true", help="play 3 beeps through the doorbell speaker"
     )
     parser.add_argument("--nvr", action="store_true", help="query Profile G recording services")
+    parser.add_argument(
+        "--listen", type=int, default=0, help="record the doorbell microphone this many seconds"
+    )
     parser.add_argument("--report", default="", help="also save the report to this file")
     args = parser.parse_args()
+    if args.listen:  # a quick test: no events, no stream analysis
+        args.events, args.stream = 0, 0
     args.user = os.environ.get("AJAX_ONVIF_USER", "")
     args.password = os.environ.get("AJAX_ONVIF_PASS", "")
     if not args.user or not args.password:
@@ -1595,6 +1736,7 @@ def main() -> int:
         print(f"profile G       {f.profile_g}")
         print(f"replay          {f.replay}")
         print(f"beep            {f.beep}")
+        print(f"listen          {f.listen}")
         if f.errors:
             print(f"errors          {f.errors}")
     if args.report:

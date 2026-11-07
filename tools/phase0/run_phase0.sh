@@ -19,7 +19,7 @@ read -rsp "Mot de passe ONVIF : " ONVIF_PASS
 echo
 
 EXTRA=()
-if [[ " $* " != *" --nvr "* ]]; then
+if [[ " $* " != *" --nvr "* && " $* " != *" --listen "* ]]; then
   read -rp "Jouer des bips dans le haut-parleur de la sonnette pour tester le micro ? [o/N] " BEEP
   [[ "${BEEP,,}" == o* ]] && EXTRA+=(--beep)
   echo
