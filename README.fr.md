@@ -14,7 +14,10 @@ officielle ONVIF et RTSP : ni cloud Ajax, ni mot de passe du compte Ajax.
 
 - **Vidéo live** par le go2rtc intégré à Home Assistant, en WebRTC. Le flux H.264
   est copié tel quel, jamais réencodé : environ 0,3 s de bout en bout sur le LAN.
-- **Écouter** : l'audio G.722 de la DoorBell arrive dans le navigateur en Opus.
+- **Écouter** : l'intégration lit l'audio G.722 de la DoorBell et le relaie à la
+  carte, qui le décode (à l'octet près comme FFmpeg) et le joue par un chemin
+  anti-écho. La conversion audio de go2rtc reste muette pour cette DoorBell : le
+  WebRTC ne transporte donc que la vidéo. Les relectures ont leur son de la même façon.
 - **Parler** : le micro du navigateur part vers le haut-parleur de la DoorBell par
   son canal de retour audio ONVIF (backchannel). La DoorBell n'y accepte que le
   G.722, que go2rtc ne sait pas produire depuis un navigateur : la carte interphone
@@ -199,7 +202,8 @@ toute seule, comme un appel entrant.
 ## Fonctionnement
 
 ```
-DoorBell ── RTSP 8554 (H.264, G.722) ──► go2rtc ── WebRTC ──► navigateur (vidéo, écoute)
+DoorBell ── RTSP 8554 (H.264) ──► go2rtc ── WebRTC ──► navigateur (vidéo)
+DoorBell ── RTSP 8554 (G.722) ──► ajax_doorbell ── websocket ──► navigateur (voix du visiteur)
 navigateur ── websocket (trames G.722) ──► ajax_doorbell ── backchannel RTSP ──► haut-parleur
 DoorBell ── ONVIF 8080 (événements PullPoint) ──► ajax_doorbell ──► entités, appel, notification
 ```

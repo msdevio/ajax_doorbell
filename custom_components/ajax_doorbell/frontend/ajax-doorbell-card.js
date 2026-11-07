@@ -34,7 +34,7 @@
  * it the card still shows the video and plays the sound.
  */
 
-const CARD_VERSION = "0.2.6";
+const CARD_VERSION = "0.3.0";
 const DOMAIN = "ajax_doorbell";
 
 const KEEPALIVE_MS = 60000; // re-answer during our call: the integration ends unattended calls
@@ -291,6 +291,191 @@ function createG711Encoder(codec) {
   };
 }
 
+function createG722Decoder() {
+  // ITU-T G.722 at 64 kbit/s, the inverse of createG722Encoder: identical to FFmpeg's decoder.
+  const QMF = [3, -11, 12, 32, -210, 951, 3876, -805, 362, -156, 53, -11];
+  const QM6 = [-136, -136, -136, -136, -24808, -21904, -19008, -16704, -14984, -13512, -12280, -11192,
+    -10232, -9360, -8576, -7856, -7192, -6576, -6000, -5456, -4944, -4464, -4008, -3576, -3168, -2776,
+    -2400, -2032, -1688, -1360, -1040, -728, 24808, 21904, 19008, 16704, 14984, 13512, 12280, 11192,
+    10232, 9360, 8576, 7856, 7192, 6576, 6000, 5456, 4944, 4464, 4008, 3576, 3168, 2776, 2400, 2032,
+    1688, 1360, 1040, 728, 432, 136, -432, -136];
+  const QM4 = [0, -20456, -12896, -8968, -6288, -4240, -2584, -1200, 20456, 12896, 8968, 6288,
+    4240, 2584, 1200, 0];
+  const QM2 = [-7408, -1616, 7408, 1616];
+  const WL = [-60, -30, 58, 172, 334, 538, 1198, 3042];
+  const RL42 = [0, 7, 6, 5, 4, 3, 2, 1, 7, 6, 5, 4, 3, 2, 1, 0];
+  const WH = [0, -214, 798];
+  const RH2 = [2, 1, 2, 1];
+  const ILB = [2048, 2093, 2139, 2186, 2233, 2282, 2332, 2383, 2435, 2489, 2543, 2599, 2656, 2714,
+    2774, 2834, 2896, 2960, 3025, 3091, 3158, 3228, 3298, 3371, 3444, 3520, 3597, 3676, 3756,
+    3838, 3922, 4008];
+  const sat = (v) => (v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+  const band = (det) => ({
+    s: 0, sp: 0, sz: 0, nb: 0, det,
+    r: [0, 0, 0], a: [0, 0, 0], ap: [0, 0, 0], p: [0, 0, 0],
+    d: [0, 0, 0, 0, 0, 0, 0], b: [0, 0, 0, 0, 0, 0, 0], bp: [0, 0, 0, 0, 0, 0, 0],
+  });
+  const update = (t, d) => {
+    const { r, a, ap, p, b, bp } = t;
+    const dd = t.d;
+    dd[0] = d;
+    r[0] = sat(t.s + d);
+    p[0] = sat(t.sz + d);
+    const sg0 = p[0] >> 15;
+    const sg1 = p[1] >> 15;
+    const sg2 = p[2] >> 15;
+    const wd1 = sat(a[1] << 2);
+    let wd2 = sg0 === sg1 ? -wd1 : wd1;
+    if (wd2 > 32767) wd2 = 32767;
+    const wd3 = (wd2 >> 7) + (sg0 === sg2 ? 128 : -128) + ((a[2] * 32512) >> 15);
+    ap[2] = wd3 > 12288 ? 12288 : wd3 < -12288 ? -12288 : wd3;
+    ap[1] = sat((sg0 === sg1 ? 192 : -192) + ((a[1] * 32640) >> 15));
+    const limit = sat(15360 - ap[2]);
+    if (ap[1] > limit) ap[1] = limit;
+    else if (ap[1] < -limit) ap[1] = -limit;
+    const step = d === 0 ? 0 : 128;
+    const sgd = d >> 15;
+    for (let i = 1; i < 7; i++) bp[i] = sat((dd[i] >> 15 === sgd ? step : -step) + ((b[i] * 32640) >> 15));
+    for (let i = 6; i > 0; i--) {
+      dd[i] = dd[i - 1];
+      b[i] = bp[i];
+    }
+    for (let i = 2; i > 0; i--) {
+      r[i] = r[i - 1];
+      p[i] = p[i - 1];
+      a[i] = ap[i];
+    }
+    t.sp = sat(((a[1] * sat(r[1] + r[1])) >> 15) + ((a[2] * sat(r[2] + r[2])) >> 15));
+    let sz = 0;
+    for (let i = 6; i > 0; i--) sz += (b[i] * sat(dd[i] + dd[i])) >> 15;
+    t.sz = sat(sz);
+    t.s = sat(t.sp + t.sz);
+  };
+  const x = new Int32Array(24);
+  const low = band(32);
+  const high = band(8);
+  return (data) => {
+    const out = new Int16Array(data.length * 2);
+    let n = 0;
+    for (let j = 0; j < data.length; j++) {
+      const code = data[j];
+      const ilow = code & 0x3f;
+      const ihigh = (code >> 6) & 0x03;
+      let rlow = low.s + ((low.det * QM6[ilow]) >> 15);
+      rlow = rlow > 16383 ? 16383 : rlow < -16384 ? -16384 : rlow;
+      const ril = ilow >> 2;
+      const dlowt = (low.det * QM4[ril]) >> 15;
+      low.nb = ((low.nb * 127) >> 7) + WL[RL42[ril]];
+      low.nb = low.nb < 0 ? 0 : low.nb > 18432 ? 18432 : low.nb;
+      let shift = 8 - (low.nb >> 11);
+      let base = ILB[(low.nb >> 6) & 31];
+      low.det = (shift < 0 ? base << -shift : base >> shift) << 2;
+      update(low, dlowt);
+
+      const dhigh = (high.det * QM2[ihigh]) >> 15;
+      let rhigh = dhigh + high.s;
+      rhigh = rhigh > 16383 ? 16383 : rhigh < -16384 ? -16384 : rhigh;
+      high.nb = ((high.nb * 127) >> 7) + WH[RH2[ihigh]];
+      high.nb = high.nb < 0 ? 0 : high.nb > 22528 ? 22528 : high.nb;
+      shift = 10 - (high.nb >> 11);
+      base = ILB[(high.nb >> 6) & 31];
+      high.det = (shift < 0 ? base << -shift : base >> shift) << 2;
+      update(high, dhigh);
+
+      x.copyWithin(0, 2);
+      x[22] = rlow + rhigh;
+      x[23] = rlow - rhigh;
+      let xout1 = 0;
+      let xout2 = 0;
+      for (let i = 0; i < 12; i++) {
+        xout2 += x[2 * i] * QMF[i];
+        xout1 += x[2 * i + 1] * QMF[11 - i];
+      }
+      out[n++] = sat(xout1 >> 11);
+      out[n++] = sat(xout2 >> 11);
+    }
+    return out;
+  };
+}
+
+function createG711Decoder(codec) {
+  const ulaw = (byte) => {
+    const b = ~byte & 0xff;
+    const value = (((b & 0x0f) << 3) + 0x84) << ((b >> 4) & 0x07);
+    return b & 0x80 ? 0x84 - value : value - 0x84;
+  };
+  const alaw = (byte) => {
+    const b = byte ^ 0x55;
+    const exponent = (b >> 4) & 0x07;
+    const mantissa = b & 0x0f;
+    const value = exponent === 0 ? (mantissa << 4) + 8 : ((mantissa << 4) + 0x108) << (exponent - 1);
+    return b & 0x80 ? value : -value;
+  };
+  const one = codec === "PCMU" ? ulaw : alaw;
+  return (data) => Int16Array.from(data, one);
+}
+
+// Plays the visitor's voice: decodes the frames the integration relays and
+// keeps a small buffer (about 120 ms) against network jitter.
+class AjaxDoorbellListen extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const codec = (options.processorOptions && options.processorOptions.codec) || "G722";
+    this.rate = codec === "G722" ? 16000 : 8000;
+    this.decode = codec === "G722" ? createG722Decoder() : createG711Decoder(codec);
+    this.step = this.rate / sampleRate;
+    this.size = this.rate * 2;
+    this.ring = new Float32Array(this.size);
+    this.written = 0;
+    this.read = 0;
+    this.playing = false;
+    this.start = Math.round(this.rate * 0.12);
+    this.limit = Math.round(this.rate * 0.4);
+    this.energy = 0;
+    this.count = 0;
+    this.blocks = 0;
+    this.port.onmessage = (event) => this.push(new Uint8Array(event.data));
+  }
+
+  push(bytes) {
+    const pcm = this.decode(bytes);
+    for (let i = 0; i < pcm.length; i++) this.ring[(this.written + i) % this.size] = pcm[i] / 32768;
+    this.written += pcm.length;
+    // Late frames piled up (a stalled tab, a burst): jump back to a short delay.
+    if (this.written - this.read > this.limit) this.read = this.written - this.start;
+  }
+
+  process(inputs, outputs) {
+    const channels = outputs[0];
+    const out = channels && channels[0];
+    if (!out) return true;
+    if (!this.playing && this.written - this.read >= this.start) this.playing = true;
+    for (let i = 0; i < out.length; i++) {
+      if (!this.playing || this.written - this.read < 2) {
+        this.playing = false; // ran dry: wait for the buffer to fill again
+        out[i] = 0;
+        continue;
+      }
+      const index = Math.floor(this.read);
+      const a = this.ring[index % this.size];
+      const value = a + (this.ring[(index + 1) % this.size] - a) * (this.read - index);
+      out[i] = value;
+      this.energy += value * value;
+      this.count += 1;
+      this.read += this.step;
+    }
+    for (let c = 1; c < channels.length; c++) channels[c].set(out);
+    if (++this.blocks % 50 === 0) {
+      this.port.postMessage({ level: this.count ? Math.sqrt(this.energy / this.count) : 0 });
+      this.energy = 0;
+      this.count = 0;
+    }
+    return true;
+  }
+}
+
+registerProcessor("ajax-doorbell-listen", AjaxDoorbellListen);
+
 // Resamples the microphone to the codec rate, encodes 20 ms frames (160 bytes)
 // and posts them. Muted, it keeps sending encoded silence so the DoorBell's
 // G.722 decoder never loses step.
@@ -433,6 +618,7 @@ const STRINGS = {
     door_opened: "Ouverte",
     door_open: "Porte ouverte",
     door_failed: "Ouverture impossible : {message}",
+    listen_failed: "Son de la sonnette indisponible : {message}",
     mic_ended: "La sonnette a coupé le micro.",
     mic_relay: "La sonnette refuse le micro : {message}",
     err_ice: "Impossible de joindre la sonnette (réseau).",
@@ -515,6 +701,7 @@ const STRINGS = {
     door_opened: "Open",
     door_open: "Door open",
     door_failed: "Could not open: {message}",
+    listen_failed: "Doorbell sound unavailable: {message}",
     mic_ended: "The doorbell closed the microphone.",
     mic_relay: "The doorbell refused the microphone: {message}",
     err_ice: "Can't reach the doorbell (network).",
@@ -549,9 +736,190 @@ const EMPTY_CALL = Object.freeze({
   answeredAt: null,
   twoWay: undefined,
   talkVia: null,
+  listenVia: null,
 });
 
 const debug = (...args) => console.debug("[ajax-doorbell-card]", ...args);
+
+/**
+ * The visitor's voice through the integration: go2rtc does not deliver the
+ * DoorBell's G.722 audio, so the integration relays its frames over the
+ * Home Assistant websocket and a worklet decodes and plays them.
+ */
+class ListenRelay {
+  constructor(hass, ctx, entityId, start, onEnded) {
+    this._hass = hass;
+    this._ctx = ctx;
+    this._entityId = entityId;
+    this._start = start;
+    this._onEnded = onEnded;
+    this._muted = true;
+    this._closed = false;
+    this._pending = [];
+    this.ready = false;
+    this.codec = null;
+    this.rate = 0;
+    this.bytes = 0;
+    this.level = null;
+  }
+
+  async start() {
+    let resolveReady;
+    let rejectReady;
+    const ready = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    const timer = setTimeout(() => rejectReady(new Error("timeout")), TALK_READY_MS);
+    try {
+      const msg = { type: `${DOMAIN}/listen`, entity_id: this._entityId };
+      if (this._start) msg.start = this._start.toISOString();
+      this._unsub = await this._hass.connection.subscribeMessage((event) => {
+        if (event.a) this._frame(event.a);
+        else if (event.type === "ready") resolveReady(event);
+        else if (event.type === "ended") this._end(event.reason);
+      }, msg);
+      if (this._closed) return this.stop();
+      const info = await ready;
+      if (this._closed) return undefined;
+      this.codec = info.codec;
+      this.rate = info.sample_rate;
+      await this._graph(info.codec);
+      if (this._closed) return this.stop();
+      this.ready = true;
+      this._pending.forEach((buffer) => this._node.port.postMessage(buffer, [buffer]));
+      this._pending = [];
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _graph(codec) {
+    const ctx = this._ctx;
+    if (!ctx.__ajaxDoorbellWorklet) {
+      const url = URL.createObjectURL(new Blob([TALK_WORKLET], { type: "text/javascript" }));
+      ctx.__ajaxDoorbellWorklet = Promise.resolve(ctx.audioWorklet.addModule(url)).finally(() => URL.revokeObjectURL(url));
+    }
+    await ctx.__ajaxDoorbellWorklet;
+    if (this._closed) return;
+    const node = new AudioWorkletNode(ctx, "ajax-doorbell-listen", {
+      processorOptions: { codec },
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+    node.port.onmessage = (event) => {
+      if (event.data && typeof event.data.level === "number") this.level = event.data.level;
+    };
+    // The decoder's 8 kHz band ends there; above it, upsampling leaves only images.
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = Math.min(7600, ctx.sampleRate / 2 - 200);
+    const gain = ctx.createGain();
+    gain.gain.value = this._muted ? 0 : 1;
+    node.connect(filter);
+    filter.connect(gain);
+    this._node = node;
+    this._filter = filter;
+    this._gain = gain;
+    if (!(await this._echoCancelledOutput(gain))) gain.connect(ctx.destination);
+  }
+
+  /**
+   * Play through a local WebRTC loop: browsers cancel the echo of what they
+   * play from WebRTC, so the visitor does not hear themselves back.
+   */
+  async _echoCancelledOutput(gain) {
+    const ctx = this._ctx;
+    if (typeof RTCPeerConnection !== "function" || typeof ctx.createMediaStreamDestination !== "function") {
+      return false;
+    }
+    let sender = null;
+    let receiver = null;
+    try {
+      const dest = ctx.createMediaStreamDestination();
+      gain.connect(dest);
+      sender = new RTCPeerConnection();
+      receiver = new RTCPeerConnection();
+      sender.onicecandidate = (e) => e.candidate && receiver.addIceCandidate(e.candidate).catch(() => {});
+      receiver.onicecandidate = (e) => e.candidate && sender.addIceCandidate(e.candidate).catch(() => {});
+      const remote = new Promise((resolve) => {
+        receiver.ontrack = (e) => resolve(e.streams[0] || new MediaStream([e.track]));
+      });
+      dest.stream.getAudioTracks().forEach((track) => sender.addTrack(track, dest.stream));
+      await sender.setLocalDescription(await sender.createOffer());
+      await receiver.setRemoteDescription(sender.localDescription);
+      await receiver.setLocalDescription(await receiver.createAnswer());
+      await sender.setRemoteDescription(receiver.localDescription);
+      const stream = await Promise.race([
+        remote,
+        new Promise((resolve, reject) => setTimeout(() => reject(new Error("no loop track")), 3000)),
+      ]);
+      const audio = document.createElement("audio");
+      audio.autoplay = true;
+      audio.srcObject = stream;
+      await audio.play();
+      if (this._closed) throw new Error("closed");
+      this._loop = { sender, receiver, audio, dest };
+      return true;
+    } catch (err) {
+      debug("echo-cancelled output unavailable, playing directly:", (err && err.message) || err);
+      try {
+        gain.disconnect();
+      } catch (e) {
+        /* ignore */
+      }
+      if (sender) sender.close();
+      if (receiver) receiver.close();
+      return false;
+    }
+  }
+
+  _frame(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    this.bytes += bytes.length;
+    if (this.ready && this._node) this._node.port.postMessage(bytes.buffer, [bytes.buffer]);
+    else if (this._pending.length < 4) this._pending.push(bytes.buffer);
+  }
+
+  setMuted(muted) {
+    this._muted = muted;
+    if (this._gain) this._gain.gain.setTargetAtTime(muted ? 0 : 1, this._ctx.currentTime, 0.015);
+  }
+
+  stop() {
+    this._closed = true;
+    this.ready = false;
+    const unsub = this._unsub;
+    this._unsub = null;
+    if (unsub) Promise.resolve().then(unsub).catch(() => {});
+    [this._node, this._filter, this._gain].forEach((node) => {
+      try {
+        if (node) node.disconnect();
+      } catch (err) {
+        /* ignore */
+      }
+    });
+    if (this._node) this._node.port.onmessage = null;
+    this._node = this._filter = this._gain = null;
+    const loop = this._loop;
+    this._loop = null;
+    if (loop) {
+      loop.audio.srcObject = null;
+      loop.sender.close();
+      loop.receiver.close();
+    }
+  }
+
+  _end(reason) {
+    if (this._closed) return;
+    this.stop();
+    this._onEnded(reason);
+  }
+}
 
 /**
  * Talk-back through the integration: the DoorBell only takes G.722, which
@@ -1599,6 +1967,7 @@ class AjaxDoorbellCard extends HTMLElement {
     this._thumbs = new Map(); // visit id -> signed thumbnail URL, kept while listed
     this._replay = null; // {camera, start, visitId, began, playing}
     this._door = "idle"; // idle | confirm | sending | done
+    this._voice = null; // ListenRelay while the visitor's voice plays
     this._replayReq = 0;
     this._ctrl = {};
     this._controlsKey = null;
@@ -1845,6 +2214,7 @@ class AjaxDoorbellCard extends HTMLElement {
       answeredAt: attrs.answered_at || null,
       twoWay: typeof attrs.two_way_audio === "boolean" ? attrs.two_way_audio : undefined,
       talkVia: attrs.talk_via || null,
+      listenVia: attrs.listen_via || null,
     };
   }
 
@@ -1855,6 +2225,11 @@ class AjaxDoorbellCard extends HTMLElement {
   /** The integration relays the voice itself (G.722 doorbells): WebRTC only receives. */
   _relayMode() {
     return this._call.talkVia === "relay";
+  }
+
+  /** The integration relays the visitor's voice too: WebRTC only carries the video. */
+  _listenMode() {
+    return this._call.listenVia === "relay";
   }
 
   /** Talk-back: forced by the config, else the call sensor, else HA's camera capabilities. */
@@ -2038,6 +2413,7 @@ class AjaxDoorbellCard extends HTMLElement {
     this._speakerOn = true;
     this._soundBlocked = false;
     this._micError = null;
+    this._primeAudio();
     this._pendingAnswer = this._callService("answer", { answered_by: this._myLabel }, true);
     this._setInterval("keepalive", () => this._keepAlive(), KEEPALIVE_MS);
     this._setInterval("clock", () => this._renderClock(), 1000);
@@ -2055,6 +2431,7 @@ class AjaxDoorbellCard extends HTMLElement {
       this._micWanted = !this._config.push_to_talk;
       this._acquireMic();
     }
+    if (this._listenMode()) this._syncListen();
     this._render();
   }
 
@@ -2067,6 +2444,7 @@ class AjaxDoorbellCard extends HTMLElement {
     this._retries = 0;
     this._mode = "view";
     this._soundBlocked = false;
+    this._primeAudio();
     this._acquireWakeLock();
     if (this._pc && this._media !== "error") {
       this._applyAudio();
@@ -2074,6 +2452,7 @@ class AjaxDoorbellCard extends HTMLElement {
       this._closeSession();
       this._connect("view");
     }
+    if (this._listenMode()) this._syncListen(); // the voice sets up alongside the video
     this._render();
   }
 
@@ -2126,6 +2505,7 @@ class AjaxDoorbellCard extends HTMLElement {
   _unmute() {
     this._speakerOn = true;
     this._soundBlocked = false;
+    this._primeAudio();
     this._applyAudio();
     this._render();
   }
@@ -2170,6 +2550,75 @@ class AjaxDoorbellCard extends HTMLElement {
     }
     debug("answering from the URL (ajax_answer=%s)", value);
     this._answer();
+  }
+
+  /* ---------- listening through the integration ---------- */
+
+  /** In a user gesture: browsers only start audio after one. */
+  _primeAudio() {
+    if (!this._listenMode()) return;
+    const ctx = this._getAudioCtx();
+    if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+  }
+
+  /** Start, move or stop the relayed voice to match the mode and the speaker. */
+  _syncListen() {
+    const wantRelay = this._mode === "view" || this._mode === "talk" || this._mode === "replay";
+    const start = this._mode === "replay" && this._replay ? this._replay.start : null;
+    const key = wantRelay ? `${this._config.camera}|${start ? start.toISOString() : "live"}` : null;
+    if (this._voice && this._voice.key !== key) this._stopListen();
+    if (!key) return;
+    const ctx = this._getAudioCtx();
+    if (!ctx || typeof AudioWorkletNode !== "function") return;
+    if (!this._voice) {
+      const relay = new ListenRelay(this._hass, ctx, this._config.camera, start, (reason) => {
+        if (this._voice !== relay) return;
+        debug("listening ended:", reason);
+        this._voice = null;
+        // The DoorBell dropped the audio session: try again shortly while still watching.
+        this._setTimeout("listen", () => this._pc && this._applyAudio(), RETRY_DELAY_MS);
+      });
+      relay.key = key;
+      this._voice = relay;
+      relay.start().catch((err) => {
+        if (this._voice !== relay) return;
+        debug("listening failed:", (err && (err.message || err.code)) || err);
+        relay.stop();
+        this._voice = null;
+        this._flash(this._t("listen_failed", { message: (err && (err.message || err.code)) || err }));
+      });
+    }
+    const wantSound = this._mode !== "preview" && this._mode !== "none" && this._speakerOn;
+    this._voice.setMuted(!wantSound);
+    if (wantSound && ctx.state === "suspended") {
+      ctx.resume().then(
+        () => {
+          if (this._soundBlocked) {
+            this._soundBlocked = false;
+            this._render();
+          }
+        },
+        () => {}
+      );
+      // Still suspended a moment later: no user gesture yet, offer the button.
+      this._setTimeout(
+        "listen_unlock",
+        () => {
+          if (ctx.state === "suspended" && this._voice && !this._soundBlocked) {
+            this._soundBlocked = true;
+            this._render();
+          }
+        },
+        500
+      );
+    }
+  }
+
+  _stopListen() {
+    this._clearTimer("listen");
+    const relay = this._voice;
+    this._voice = null;
+    if (relay) relay.stop();
   }
 
   /* ---------- door (any lock entity: a Nuki opens with lock.open) ---------- */
@@ -2373,6 +2822,7 @@ class AjaxDoorbellCard extends HTMLElement {
     const latest = Date.now() - 2000;
     const from = new Date(Math.min(start.getTime(), latest));
     this._unlockMedia();
+    this._primeAudio();
     const req = ++this._replayReq;
     let result;
     try {
@@ -2391,6 +2841,7 @@ class AjaxDoorbellCard extends HTMLElement {
     this._acquireWakeLock();
     this._setInterval("clock", () => this._renderClock(), 1000);
     this._connect("replay");
+    if (this._listenMode()) this._syncListen();
     this._render();
   }
 
@@ -2469,7 +2920,11 @@ class AjaxDoorbellCard extends HTMLElement {
       // answering swaps the microphone in with replaceTrack, without renegotiating.
       // With the integration's relay, the voice goes another way: receive only.
       const sendAudio = talk && !this._relayMode();
-      this._audioTx = pc.addTransceiver("audio", { direction: sendAudio ? "sendrecv" : "recvonly" });
+      // With the integration relaying the visitor's voice, WebRTC carries the
+      // video alone: go2rtc then starts no audio transcoding at all.
+      if (sendAudio || !this._listenMode()) {
+        this._audioTx = pc.addTransceiver("audio", { direction: sendAudio ? "sendrecv" : "recvonly" });
+      }
       pc.addTransceiver("video", { direction: "recvonly" });
       if (clientConfig && clientConfig.dataChannel) pc.createDataChannel(clientConfig.dataChannel);
       this._remoteStream = new MediaStream();
@@ -2722,6 +3177,7 @@ class AjaxDoorbellCard extends HTMLElement {
   /** Close the peer connection and the HA session; keeps the mode, the call and the mic. */
   _closeSession() {
     this._gen += 1;
+    this._stopListen();
     ["connect", "grace", "stats", "attach", "stable"].forEach((name) => this._clearTimer(name));
     const unsub = this._unsub;
     this._unsub = null;
@@ -2804,7 +3260,8 @@ class AjaxDoorbellCard extends HTMLElement {
     const video = this._els.video;
     if (!video) return;
     const wantSound = this._mode !== "preview" && this._mode !== "none" && this._speakerOn;
-    video.muted = !wantSound;
+    if (this._listenMode()) this._syncListen();
+    video.muted = !wantSound || this._listenMode();
     if (!video.srcObject) return;
     let playing;
     try {
@@ -3473,6 +3930,17 @@ class AjaxDoorbellCard extends HTMLElement {
         ? ` · ${this._t("st_level")} ${audioIn.audioLevel > 0 ? `${Math.round(20 * Math.log10(audioIn.audioLevel))} dB` : "—"}`
         : "";
     const muted = this._els.video && this._els.video.muted ? ` (${this._t("st_muted")})` : "";
+    const relay = this._voice;
+    let relayLine = null;
+    if (relay) {
+      let relayRate = "";
+      if (prev && typeof prev.relayBytes === "number" && relay.bytes >= prev.relayBytes) {
+        relayRate = ` · ${Math.round(((relay.bytes - prev.relayBytes) * 8) / ((now - prev.time) / 1000) / 1000)} kb/s`;
+      }
+      const relayLevel = relay.level > 0 ? ` · ${this._t("st_level")} ${Math.round(20 * Math.log10(relay.level))} dB` : "";
+      relayLine = `${this._t("st_audio_in")} ${relay.codec ? `${relay.codec} ${relay.rate / 1000} kHz` : "…"} (${this._t("st_relay")})${relayRate}${relayLevel}${relay._muted ? ` (${this._t("st_muted")})` : ""}`;
+    }
+    this._statsPrev.relayBytes = relay ? relay.bytes : undefined;
 
     const size = videoIn && videoIn.frameWidth ? `${videoIn.frameWidth}×${videoIn.frameHeight}` : "—";
     const fps =
@@ -3482,7 +3950,7 @@ class AjaxDoorbellCard extends HTMLElement {
       `${this._t("st_jitter")} ${ms(audioIn && audioIn.jitter)} (A) · ${ms(videoIn && videoIn.jitter)} (V)`,
       `${this._t("st_loss")} ${loss}`,
       `${this._t("st_video")} ${size}${fps} · ${codec(videoIn)}${rate}`,
-      `${this._t("st_audio_in")} ${codec(audioIn)}${audioRate}${level}${muted}`,
+      relayLine || `${this._t("st_audio_in")} ${codec(audioIn)}${audioRate}${level}${muted}`,
       `${this._t("st_audio_out")} ${
         this._relay && this._relay.ready ? `${this._relay.codec} (${this._t("st_relay")})` : audioOut ? codec(audioOut) : "—"
       }${this._micLive ? "" : ` (${this._t("st_off")})`}`,

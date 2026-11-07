@@ -23,6 +23,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
 from .doorbell import AjaxDoorbell
+from .listen import websocket_listen
 from .onvif import OnvifAuthError, OnvifError
 from .services import async_setup_services
 from .talk import websocket_talk
@@ -40,6 +41,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register the services, the talk command and the intercom card once."""
     async_setup_services(hass)
     websocket_api.async_register_command(hass, websocket_talk)
+    websocket_api.async_register_command(hass, websocket_listen)
     websocket_api.async_register_command(hass, websocket_visits)
     websocket_api.async_register_command(hass, websocket_replay)
     if hass.http is not None:

@@ -14,7 +14,10 @@ official ONVIF and RTSP interface: no Ajax cloud, no Ajax account password.
 
 - **Live video** through Home Assistant's built-in go2rtc over WebRTC. The H.264
   stream is copied as is, never re-encoded: about 0.3 s glass to glass on the LAN.
-- **Listen**: the DoorBell's G.722 audio reaches the browser as Opus.
+- **Listen**: the integration reads the DoorBell's G.722 audio and relays it to the
+  card, which decodes it (bit-exact with FFmpeg) and plays it through an
+  echo-cancelled path. go2rtc's own audio transcoding stays silent for this
+  DoorBell, so WebRTC carries the video alone. Replays get their sound the same way.
 - **Talk**: the browser microphone goes to the DoorBell speaker through its ONVIF
   audio backchannel. The DoorBell only takes G.722 there, which go2rtc cannot make
   from a browser, so the intercom card encodes the microphone itself (bit-exact with
@@ -180,7 +183,8 @@ also open the intercom view by itself, like an incoming call.
 ## How it works
 
 ```
-DoorBell ── RTSP 8554 (H.264, G.722) ──► go2rtc ── WebRTC ──► browser (video, listening)
+DoorBell ── RTSP 8554 (H.264) ──► go2rtc ── WebRTC ──► browser (video)
+DoorBell ── RTSP 8554 (G.722) ──► ajax_doorbell ── websocket ──► browser (the visitor's voice)
 browser ── websocket (G.722 frames) ──► ajax_doorbell ── RTSP backchannel ──► DoorBell speaker
 DoorBell ── ONVIF 8080 (PullPoint events) ──► ajax_doorbell ──► entities, call state, notification
 ```

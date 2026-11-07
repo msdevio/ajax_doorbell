@@ -8,6 +8,7 @@ audio backchannel, a track go2rtc cannot feed in G.722.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 import hashlib
@@ -107,6 +108,19 @@ def parse_sdp(sdp: str) -> tuple[SdpMedia, ...]:
     )
 
 
+def rtp_payload(packet: bytes) -> bytes | None:
+    """Return the payload of an RTP packet (CSRCs, extension and padding removed)."""
+    if len(packet) < 12 or packet[0] >> 6 != 2:
+        return None
+    start = 12 + 4 * (packet[0] & 0x0F)
+    if packet[0] & 0x10:
+        if len(packet) < start + 4:
+            return None
+        start += 4 + 4 * int.from_bytes(packet[start + 2 : start + 4], "big")
+    end = len(packet) - (packet[-1] if packet[0] & 0x20 else 0)
+    return packet[start:end] if end > start else None
+
+
 def media_url(base: str, control: str) -> str:
     """Return the URL of a track: its control attribute against the content base."""
     if not control or control == "*":
@@ -174,6 +188,8 @@ class RtspConnection:
         self._pending: dict[int, asyncio.Future[tuple[int, dict[str, str], bytes]]] = {}
         self._pump: asyncio.Task[None] | None = None
         self.closed = asyncio.Event()
+        # Called with (channel, packet) for each interleaved frame the device sends.
+        self.on_frame: Callable[[int, bytes], None] | None = None
 
     async def connect(self) -> None:
         """Open the TCP connection."""
@@ -189,7 +205,9 @@ class RtspConnection:
         first = await self._reader.readexactly(1)
         if first == b"$":
             header = await self._reader.readexactly(3)
-            await self._reader.readexactly(int.from_bytes(header[1:], "big"))
+            packet = await self._reader.readexactly(int.from_bytes(header[1:], "big"))
+            if self.on_frame is not None:
+                self.on_frame(header[0], packet)
             return None
         status_line, headers = _parse_head(first + await self._reader.readuntil(b"\r\n\r\n"))
         length = int(headers.get("content-length", "0") or 0)

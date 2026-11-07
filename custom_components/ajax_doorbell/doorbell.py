@@ -46,6 +46,7 @@ from .const import (
     TOPIC_TRACKING,
 )
 from .events import EventStream
+from .listen import LISTEN_ENCODINGS, ListenSession
 from .nvr import AjaxNvr, NvrError
 from .onvif import (
     AjaxOnvifClient,
@@ -65,6 +66,10 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+# Keep the shared audio session this long after the last listener: a screen
+# switching views comes back without a new RTSP setup.
+LISTEN_LINGER = 10
 
 DETECTIONS = ("motion", "pir", "person", "vehicle", "pet")
 # AI detections turn off by themselves after DETECTION_HOLD seconds should the
@@ -224,6 +229,9 @@ class AjaxDoorbell:
         self._reprobe: asyncio.Task | None = None
         self.talk: TalkSession | None = None
         self._talk_lock = asyncio.Lock()
+        self._listen: ListenSession | None = None
+        self._listen_lock = asyncio.Lock()
+        self._listen_linger: CALLBACK_TYPE | None = None
         self._call_state = self.call.state
         self.call.async_add_listener(self._call_changed)
 
@@ -304,6 +312,12 @@ class AjaxDoorbell:
         await self.events.async_stop()
         if self.talk is not None:
             await self.async_stop_talk(self.talk, "unloaded")
+        if self._listen_linger is not None:
+            self._listen_linger()
+            self._listen_linger = None
+        if self._listen is not None:
+            await self._listen.async_close("unloaded")
+            self._listen = None
         self.call.shutdown()
         self.detections.shutdown()
 
@@ -465,6 +479,80 @@ class AjaxDoorbell:
             raise NvrError("the NVR is not available")
         self.replay_start = start
         self._notify_replay()
+
+    # ----------------------------------------------------------------- listen
+
+    @property
+    def listen_codec(self) -> str | None:
+        """Return the stream's audio codec when the card can play it through the relay."""
+        audio = self.description.audio if self.description else None
+        if audio is None or not audio.codecs:
+            return None
+        name = audio.codecs[0].split("/", 1)[0].upper()
+        return name if name in LISTEN_ENCODINGS else None
+
+    async def async_listen(
+        self, listener: Callable[[bytes], None], start: datetime | None = None
+    ) -> tuple[ListenSession, Callable[[], None]]:
+        """Hand the DoorBell's audio to listener: live, or the NVR's from start.
+
+        Returns the session and how to stop listening. Live listening shares
+        one session, kept a little after the last listener leaves.
+        """
+        if start is not None:
+            if self.nvr is None:
+                raise NvrError("the NVR is not available")
+            replay = ListenSession(self.nvr.replay_url(start), "", "")  # the local relay
+            await replay.async_open()
+            forget = replay.add_listener(listener)
+
+            @callback
+            def stop_replay() -> None:
+                forget()
+                self.entry.async_create_background_task(
+                    self.hass, replay.async_close(), "ajax_doorbell replay audio"
+                )
+
+            return replay, stop_replay
+
+        if self.main_profile is None:
+            raise RtspError(f"{self.client.host}: no stream")
+        async with self._listen_lock:
+            if self._listen_linger is not None:
+                self._listen_linger()
+                self._listen_linger = None
+            session = self._listen
+            if session is None or session.ended is not None:
+                data = self.entry.data
+                session = ListenSession(
+                    self.stream_url(self.main_profile, with_credentials=False),
+                    data[CONF_USERNAME],
+                    data[CONF_PASSWORD],
+                )
+                await session.async_open()
+                self._listen = session
+            forget = session.add_listener(listener)
+
+        @callback
+        def stop() -> None:
+            forget()
+            if session.listeners or session is not self._listen:
+                return
+
+            @callback
+            def close(_now: datetime) -> None:
+                self._listen_linger = None
+                if session.listeners == 0 and session is self._listen:
+                    self._listen = None
+                    self.entry.async_create_background_task(
+                        self.hass, session.async_close(), "ajax_doorbell audio"
+                    )
+
+            if self._listen_linger is not None:
+                self._listen_linger()
+            self._listen_linger = async_call_later(self.hass, LISTEN_LINGER, close)
+
+        return session, stop
 
     # ------------------------------------------------------------------- talk
 

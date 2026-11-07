@@ -77,6 +77,8 @@ class CallStateSensor(_CallSensor, SensorEntity):
             # The card talks through the integration's relay; see talk.py.
             "two_way_audio": self._doorbell.talk_codec is not None,
             "talk_via": "relay" if self._doorbell.talk_codec else None,
+            # The card plays the visitor's voice from the integration too; see listen.py.
+            "listen_via": "relay" if self._doorbell.listen_codec else None,
         }
 
 
