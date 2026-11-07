@@ -96,6 +96,17 @@ async def test_dhcp_ignores_the_hub(hass: HomeAssistant, mock_client: MagicMock)
     assert result["reason"] == "not_video_device"
 
 
+async def test_dhcp_ignores_the_nvr(hass: HomeAssistant, mock_client: MagicMock) -> None:
+    """The NVR shares the Ajax prefix and ONVIF, but has recording services."""
+    mock_client.async_get_services.return_value = {"device": "x", "search": "y", "replay": "z"}
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_DHCP}, data=DHCP
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "nvr"
+    mock_client.async_get_services.assert_awaited_with(auth=False)
+
+
 async def test_dhcp_updates_the_address(
     hass: HomeAssistant, mock_client: MagicMock, mock_entry: MockConfigEntry
 ) -> None:

@@ -142,7 +142,8 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
         """Handle a device with the Ajax MAC prefix.
 
         The hub shares the prefix but has no ONVIF service: an unauthenticated
-        clock request tells the two apart without needing any account.
+        clock request tells the two apart without needing any account. The NVR
+        has ONVIF too, but also the recording services a DoorBell lacks.
         """
         mac = format_mac(discovery_info.macaddress)
         await self.async_set_unique_id(mac)
@@ -154,6 +155,12 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
             await client.async_update_time_offset()
         except OnvifError:
             return self.async_abort(reason="not_video_device")
+        try:
+            services = await client.async_get_services(auth=False)
+        except OnvifError:
+            services = {}  # some firmwares want an account here: offer the device
+        if {"search", "replay"} & services.keys():
+            return self.async_abort(reason="nvr")
         self._host, self._mac = discovery_info.ip, mac
         self.context["title_placeholders"] = {"name": f"Ajax ({discovery_info.ip})"}
         return await self.async_step_user()

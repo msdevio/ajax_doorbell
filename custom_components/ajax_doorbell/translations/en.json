@@ -40,6 +40,7 @@
     },
     "abort": {
       "already_configured": "This DoorBell is already set up.",
+      "nvr": "This is an Ajax NVR, not a DoorBell.",
       "not_video_device": "This Ajax device has no ONVIF service (probably a hub).",
       "reauth_successful": "The ONVIF account works again.",
       "reconfigure_successful": "The address was updated.",

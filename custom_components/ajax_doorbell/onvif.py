@@ -460,12 +460,13 @@ class AjaxOnvifClient:
             self._offset = device - datetime.now(UTC)
         return self._offset
 
-    async def async_get_services(self) -> dict[str, str]:
-        """Read the service endpoints."""
+    async def async_get_services(self, *, auth: bool = True) -> dict[str, str]:
+        """Read the service endpoints (Ajax devices also answer without an account)."""
         root = await self._call(
             self.service_url("device"),
             f'<GetServices xmlns="{NS_DEVICE}"><IncludeCapability>false'
             "</IncludeCapability></GetServices>",
+            auth=auth,
         )
         for svc in find_all(root, "Service"):
             name = SERVICES.get(find_text(svc, "Namespace"))
