@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wstop="http://docs.oasis-open.org/wsn/t-1" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsajax="http://ajax.systems/onvif/topics" xmlns:tt="http://www.onvif.org/ver10/schema">
+<SOAP-ENV:Body><tev:GetEventPropertiesResponse><wstop:TopicSet>
+<tns1:RuleEngine>
+<RingDetector><Detection wstop:topic="true"><tt:MessageDescription IsProperty="true"><tt:Data><tt:SimpleItemDescription Name="Detected" Type="xs:boolean"/></tt:Data></tt:MessageDescription></Detection></RingDetector>
+<tnsajax:MotionDetector><Detection wstop:topic="true"/></tnsajax:MotionDetector>
+<tnsajax:ObjectDetector><Detection wstop:topic="true"/></tnsajax:ObjectDetector>
+</tns1:RuleEngine>
+</wstop:TopicSet></tev:GetEventPropertiesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>

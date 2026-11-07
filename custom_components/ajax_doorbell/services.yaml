@@ -1,0 +1,29 @@
+answer:
+  target:
+    device:
+      integration: ajax_doorbell
+    entity:
+      integration: ajax_doorbell
+  fields:
+    answered_by:
+      example: "Tablette de l'entrée"
+      selector:
+        text:
+hang_up:
+  target:
+    device:
+      integration: ajax_doorbell
+    entity:
+      integration: ajax_doorbell
+dismiss:
+  target:
+    device:
+      integration: ajax_doorbell
+    entity:
+      integration: ajax_doorbell
+clear_missed:
+  target:
+    device:
+      integration: ajax_doorbell
+    entity:
+      integration: ajax_doorbell

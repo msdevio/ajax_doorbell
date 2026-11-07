@@ -1,0 +1,12 @@
+.venv*/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+# Never commit credentials, captured sessions or probe reports
+secrets/
+*.env
+*.token
+tools/phase0/reports/

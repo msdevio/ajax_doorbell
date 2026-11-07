@@ -1,0 +1,42 @@
+[project]
+name = "ajax_doorbell"
+version = "0.1.0"
+description = "Home Assistant custom integration for the Ajax DoorBell: local live video, two-way audio and instant ring events"
+requires-python = ">=3.13"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+# Home Assistant 2026.11 aliases httpx to httpx2 on import and refuses to if
+# httpx came first, which the test harness plugins do: load HA itself first.
+addopts = [
+    "--disable-plugin-autoload",
+    "-p", "homeassistant.const",
+    "-p", "pytest_socket",
+    "-p", "pytest_asyncio.plugin",
+    "-p", "pytest_aiohttp.plugin",
+    "-p", "pytest_homeassistant_custom_component.plugins",
+    "-p", "syrupy",
+    "-p", "pytest_freezer",
+    "-p", "pytest_unordered",
+    "-p", "pytest_timeout",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
+ignore = [
+    "E501",
+    "ASYNC109",  # our own timeout parameters, not asyncio's
+    "RUF012",  # Home Assistant entities declare _attr_* lists on the class
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["custom_components", "homeassistant"]
+force-sort-within-sections = true
+combine-as-imports = true

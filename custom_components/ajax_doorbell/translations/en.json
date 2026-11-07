@@ -1,0 +1,129 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Ajax DoorBell",
+        "description": "Use an ONVIF account created in the Ajax app: Devices → DoorBell → Settings → Service → Connection via ONVIF → ONVIF users. The Operator role is enough.",
+        "data": {
+          "host": "Host",
+          "username": "ONVIF username",
+          "password": "ONVIF password",
+          "port": "ONVIF port",
+          "rtsp_port": "RTSP port"
+        },
+        "data_description": {
+          "host": "IP address of the DoorBell on your network. Give it a fixed lease in your router.",
+          "username": "Not your Ajax account: the local ONVIF user of the DoorBell.",
+          "port": "8080 unless you changed it in the Ajax app.",
+          "rtsp_port": "8554 unless you changed it in the Ajax app."
+        }
+      },
+      "reauth_confirm": {
+        "title": "ONVIF account refused",
+        "description": "The DoorBell at {host} refused the ONVIF account. Enter it again, or create a new one in the Ajax app.",
+        "data": {
+          "username": "ONVIF username",
+          "password": "ONVIF password"
+        }
+      },
+      "reconfigure": {
+        "title": "Change the DoorBell address",
+        "data": {
+          "host": "Host",
+          "port": "ONVIF port",
+          "rtsp_port": "RTSP port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach the device. Check the address and that ONVIF is enabled in the Ajax app.",
+      "invalid_auth": "The device refused this ONVIF account.",
+      "no_profiles": "The device answers ONVIF but shares no video stream with this account."
+    },
+    "abort": {
+      "already_configured": "This DoorBell is already set up.",
+      "not_video_device": "This Ajax device has no ONVIF service (probably a hub).",
+      "reauth_successful": "The ONVIF account works again.",
+      "reconfigure_successful": "The address was updated.",
+      "wrong_device": "This address belongs to another device."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Calls",
+        "data": {
+          "ring_duration": "Ring duration",
+          "call_timeout": "Maximum call length"
+        },
+        "data_description": {
+          "ring_duration": "How long a ring waits for an answer before it counts as missed.",
+          "call_timeout": "A call nobody hangs up ends by itself after this time."
+        }
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "ringing": { "name": "Incoming call" },
+      "motion": { "name": "Motion" },
+      "person": { "name": "Person" },
+      "vehicle": { "name": "Vehicle" },
+      "pet": { "name": "Animal" },
+      "event_stream": { "name": "Event stream" }
+    },
+    "camera": {
+      "substream": { "name": "Substream" }
+    },
+    "event": {
+      "ring": {
+        "name": "Doorbell",
+        "state_attributes": {
+          "event_type": { "state": { "ring": "Ring" } }
+        }
+      }
+    },
+    "sensor": {
+      "call_state": {
+        "name": "Call",
+        "state": {
+          "idle": "Idle",
+          "ringing": "Ringing",
+          "in_call": "In call"
+        }
+      },
+      "last_ring": { "name": "Last ring" },
+      "missed_calls": { "name": "Missed calls" }
+    }
+  },
+  "exceptions": {
+    "invalid_auth": { "message": "The DoorBell refused the ONVIF account." },
+    "cannot_connect": { "message": "Cannot reach the DoorBell: {error}" },
+    "no_doorbell": { "message": "No loaded Ajax DoorBell matches this target." }
+  },
+  "services": {
+    "answer": {
+      "name": "Answer",
+      "description": "Marks the call as answered: the ringing stops on every screen.",
+      "fields": {
+        "answered_by": {
+          "name": "Answered by",
+          "description": "Name of the screen or person who answered, shown on the other screens."
+        }
+      }
+    },
+    "hang_up": {
+      "name": "Hang up",
+      "description": "Ends the current call."
+    },
+    "dismiss": {
+      "name": "Dismiss",
+      "description": "Stops the ringing without answering."
+    },
+    "clear_missed": {
+      "name": "Clear missed calls",
+      "description": "Resets the missed call counter."
+    }
+  }
+}

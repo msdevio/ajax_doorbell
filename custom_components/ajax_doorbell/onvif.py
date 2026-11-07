@@ -1,0 +1,581 @@
+"""Small async ONVIF client for Ajax video devices.
+
+It covers what the integration needs and nothing more: device identity, media
+profiles and stream URIs, the event topic set and a PullPoint subscription.
+Requests are SOAP 1.2 with a WS-Security UsernameToken digest; when the device
+answers 401 the client switches to HTTP Digest as well and keeps it.
+"""
+
+from __future__ import annotations
+
+import base64
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+import hashlib
+import logging
+import secrets
+from urllib.parse import urlsplit, urlunsplit
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
+
+import aiohttp
+
+_LOGGER = logging.getLogger(__name__)
+
+NS_SOAP = "http://www.w3.org/2003/05/soap-envelope"
+NS_WSA = "http://www.w3.org/2005/08/addressing"
+NS_TT = "http://www.onvif.org/ver10/schema"
+NS_DEVICE = "http://www.onvif.org/ver10/device/wsdl"
+NS_MEDIA = "http://www.onvif.org/ver10/media/wsdl"
+NS_MEDIA2 = "http://www.onvif.org/ver20/media/wsdl"
+NS_EVENTS = "http://www.onvif.org/ver10/events/wsdl"
+NS_WSNT = "http://docs.oasis-open.org/wsn/b-2"
+
+SERVICES = {
+    NS_DEVICE: "device",
+    NS_MEDIA: "media",
+    NS_MEDIA2: "media2",
+    NS_EVENTS: "events",
+    "http://www.onvif.org/ver10/deviceIO/wsdl": "deviceio",
+    "http://www.onvif.org/ver10/search/wsdl": "search",
+    "http://www.onvif.org/ver10/replay/wsdl": "replay",
+    "http://www.onvif.org/ver10/recording/wsdl": "recording",
+}
+# Paths Ajax uses when GetServices has not been read yet.
+DEFAULT_PATHS = {
+    "device": "device_service",
+    "media": "media_service",
+    "media2": "media2_service",
+    "events": "event_service",
+}
+TOPIC_PREFIXES = {
+    "http://www.onvif.org/ver10/topics": "tns1",
+    "http://ajax.systems/onvif/topics": "tnsajax",
+}
+
+ACTION_PULL = "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest"
+ACTION_SYNC = (
+    "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/SetSynchronizationPointRequest"
+)
+ACTION_RENEW = "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest"
+ACTION_UNSUBSCRIBE = "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/UnsubscribeRequest"
+
+
+class OnvifError(Exception):
+    """The device answered with an error."""
+
+
+class OnvifConnectionError(OnvifError):
+    """The device could not be reached."""
+
+
+class OnvifAuthError(OnvifError):
+    """The device refused the credentials."""
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceIdentity:
+    """What GetDeviceInformation returns."""
+
+    manufacturer: str
+    model: str
+    firmware: str
+    serial: str
+
+
+@dataclass(frozen=True, slots=True)
+class MediaProfile:
+    """One media profile, reduced to what the integration shows or uses."""
+
+    token: str
+    name: str
+    encoding: str | None = None
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+    bitrate: int | None = None
+    gov_length: int | None = None
+    audio_encoding: str | None = None
+    audio_sample_rate: int | None = None
+    audio_output: bool = False
+
+    @property
+    def pixels(self) -> int:
+        """Return the frame size, used to rank main and sub streams."""
+        return (self.width or 0) * (self.height or 0)
+
+
+@dataclass(frozen=True, slots=True)
+class OnvifEvent:
+    """One notification from a PullPoint."""
+
+    topic: str
+    operation: str
+    utc_time: datetime | None
+    source: dict[str, str]
+    data: dict[str, str]
+
+
+@dataclass(slots=True)
+class PullPoint:
+    """An active PullPoint subscription."""
+
+    address: str
+
+
+def local_name(tag: str) -> str:
+    """Strip the namespace from an ElementTree tag."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _namespace(tag: str) -> str:
+    return tag[1:].split("}", 1)[0] if tag.startswith("{") else ""
+
+
+def find_all(elem: ET.Element, name: str) -> list[ET.Element]:
+    """Return the descendants of elem (not elem itself) with this local name."""
+    return [n for n in elem.iter() if n is not elem and local_name(n.tag) == name]
+
+
+def find(elem: ET.Element | None, name: str) -> ET.Element | None:
+    """Return the first descendant with this local name."""
+    if elem is None:
+        return None
+    return next((n for n in elem.iter() if n is not elem and local_name(n.tag) == name), None)
+
+
+def find_any(elem: ET.Element | None, *names: str) -> ET.Element | None:
+    """Return the first descendant matching any of the names, in name order."""
+    for name in names:
+        if (node := find(elem, name)) is not None:
+            return node
+    return None
+
+
+def find_text(elem: ET.Element | None, name: str) -> str:
+    """Return the stripped text of the first descendant with this local name."""
+    node = find(elem, name)
+    return (node.text or "").strip() if node is not None else ""
+
+
+def _int(value: str | None) -> int | None:
+    try:
+        return int(float(value)) if value else None
+    except ValueError:
+        return None
+
+
+def _float(value: str | None) -> float | None:
+    try:
+        return float(value) if value else None
+    except ValueError:
+        return None
+
+
+def parse_fault(raw: bytes) -> str:
+    """Return a short readable reason from a SOAP fault body."""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return raw[:120].decode(errors="replace") or "empty response"
+    codes = [n.text for n in find_all(root, "Value") if n.text]
+    return " ".join(filter(None, [find_text(root, "Text"), *codes])) or "SOAP fault"
+
+
+def parse_profiles(root: ET.Element) -> list[MediaProfile]:
+    """Parse a Media2 (or Media1) GetProfiles response."""
+    profiles = []
+    for node in find_all(root, "Profiles"):
+        video = find_any(node, "VideoEncoder", "VideoEncoderConfiguration")
+        audio = find_any(node, "AudioEncoder", "AudioEncoderConfiguration")
+        resolution = find(video, "Resolution")
+        rate = find(video, "RateControl")
+        gov = (video.get("GovLength") if video is not None else None) or find_text(
+            video, "GovLength"
+        )
+        profiles.append(
+            MediaProfile(
+                token=node.get("token", ""),
+                name=find_text(node, "Name"),
+                encoding=find_text(video, "Encoding") or None,
+                width=_int(find_text(resolution, "Width")),
+                height=_int(find_text(resolution, "Height")),
+                fps=_float(find_text(rate, "FrameRateLimit")),
+                bitrate=_int(find_text(rate, "BitrateLimit")),
+                gov_length=_int(gov),
+                audio_encoding=find_text(audio, "Encoding") or None,
+                audio_sample_rate=_int(find_text(audio, "SampleRate")),
+                audio_output=(
+                    find_any(node, "AudioOutput", "AudioOutputConfiguration") is not None
+                ),
+            )
+        )
+    return [p for p in profiles if p.token]
+
+
+def parse_topics(root: ET.Element) -> list[str]:
+    """Flatten a GetEventProperties TopicSet into topic paths."""
+    topic_set = find(root, "TopicSet")
+    topics: list[str] = []
+    if topic_set is None:
+        return topics
+
+    def walk(node: ET.Element, path: list[str]) -> None:
+        for child in node:
+            name = local_name(child.tag)
+            if name in ("MessageDescription", "Documentation"):
+                continue
+            prefix = TOPIC_PREFIXES.get(_namespace(child.tag))
+            if not path:
+                part = f"{prefix or 'tns1'}:{name}"
+            elif prefix and prefix != "tns1":
+                part = f"{prefix}:{name}"
+            else:
+                part = name
+            if any(
+                local_name(key) == "topic" and value.lower() == "true"
+                for key, value in child.attrib.items()
+            ):
+                topics.append("/".join([*path, part]))
+            walk(child, [*path, part])
+
+    walk(topic_set, [])
+    return topics
+
+
+def parse_notifications(root: ET.Element) -> list[OnvifEvent]:
+    """Parse the NotificationMessage elements of a PullMessages response."""
+    events = []
+    for msg in find_all(root, "NotificationMessage"):
+        topic = find_text(msg, "Topic")
+        message = find(find(msg, "Message"), "Message")
+        if message is None:
+            continue
+        items: dict[str, dict[str, str]] = {"Source": {}, "Data": {}}
+        for block, values in items.items():
+            node = find(message, block)
+            if node is None:
+                continue
+            for item in find_all(node, "SimpleItem"):
+                if (name := item.get("Name")) is not None:
+                    values[name] = item.get("Value", "")
+        utc_time = None
+        if stamp := message.get("UtcTime"):
+            try:
+                utc_time = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except ValueError:
+                utc_time = None
+        events.append(
+            OnvifEvent(
+                topic=topic,
+                operation=message.get("PropertyOperation", ""),
+                utc_time=utc_time,
+                source=items["Source"],
+                data=items["Data"],
+            )
+        )
+    return events
+
+
+class AjaxOnvifClient:
+    """Talk ONVIF to one Ajax DoorBell, camera or NVR."""
+
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+    ) -> None:
+        """Initialize the client."""
+        self._session = session
+        self.host = host
+        self.port = port
+        self._username = username
+        self._password = password
+        self._offset = timedelta(0)
+        self._http_digest = False
+        self._digest_middleware: aiohttp.DigestAuthMiddleware | None = None
+        self.services: dict[str, str] = {}
+
+    @property
+    def _digest(self) -> aiohttp.DigestAuthMiddleware:
+        """Return the HTTP Digest middleware, built on first use."""
+        if self._digest_middleware is None:
+            self._digest_middleware = aiohttp.DigestAuthMiddleware(self._username, self._password)
+        return self._digest_middleware
+
+    @property
+    def time_offset(self) -> timedelta:
+        """Return how far the device clock is ahead of ours."""
+        return self._offset
+
+    @property
+    def uses_http_digest(self) -> bool:
+        """Return True once the device asked for HTTP Digest."""
+        return self._http_digest
+
+    def _same_host(self, url: str) -> str:
+        """Point a device-provided address at the host and port we were given.
+
+        Devices report their own idea of their address; after a DHCP change, or
+        behind NAT, that is not the one Home Assistant reaches them on.
+        """
+        parts = urlsplit(url)
+        if not parts.scheme.startswith("http") or not parts.hostname:
+            return url
+        netloc = f"{self.host}:{parts.port}" if parts.port else self.host
+        return urlunsplit(parts._replace(netloc=netloc))
+
+    def service_url(self, name: str) -> str:
+        """Return the endpoint of a service."""
+        if name in self.services:
+            return self.services[name]
+        return f"http://{self.host}:{self.port}/onvif/{DEFAULT_PATHS[name]}"
+
+    def _security_header(self) -> str:
+        created = (datetime.now(UTC) + self._offset).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        nonce = secrets.token_bytes(16)
+        digest = base64.b64encode(
+            hashlib.sha1(nonce + created.encode() + self._password.encode()).digest()
+        ).decode()
+        return (
+            '<wsse:Security s:mustUnderstand="1" xmlns:wsse="http://docs.oasis-open.org'
+            '/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http:'
+            "//docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0"
+            '.xsd"><wsse:UsernameToken>'
+            f"<wsse:Username>{escape(self._username)}</wsse:Username>"
+            '<wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-'
+            f'wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password>'
+            '<wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-'
+            '200401-wss-soap-message-security-1.0#Base64Binary">'
+            f"{base64.b64encode(nonce).decode()}</wsse:Nonce>"
+            f"<wsu:Created>{created}</wsu:Created></wsse:UsernameToken></wsse:Security>"
+        )
+
+    async def _call(
+        self,
+        url: str,
+        body: str,
+        *,
+        auth: bool = True,
+        action: str | None = None,
+        timeout: float = 10,
+    ) -> ET.Element:
+        header = self._security_header() if auth else ""
+        if action:
+            header += f"<wsa:Action>{action}</wsa:Action><wsa:To>{escape(url)}</wsa:To>"
+        envelope = (
+            f'<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="{NS_SOAP}" '
+            f'xmlns:wsa="{NS_WSA}" xmlns:tt="{NS_TT}">'
+            + (f"<s:Header>{header}</s:Header>" if header else "")
+            + f"<s:Body>{body}</s:Body></s:Envelope>"
+        )
+        content_type = "application/soap+xml; charset=utf-8"
+        if action:
+            content_type += f'; action="{action}"'
+        try:
+            async with self._session.post(
+                url,
+                data=envelope.encode(),
+                headers={"Content-Type": content_type},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                middlewares=(self._digest,) if auth and self._http_digest else (),
+            ) as resp:
+                status, raw = resp.status, await resp.read()
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise OnvifConnectionError(f"{self.host}: {err or type(err).__name__}") from err
+        refused = status == 401 or (status in (400, 500) and b"NotAuthorized" in raw)
+        if refused:
+            if auth and not self._http_digest:
+                _LOGGER.debug("%s asks for HTTP Digest, switching", self.host)
+                self._http_digest = True
+                return await self._call(url, body, auth=auth, action=action, timeout=timeout)
+            raise OnvifAuthError(f"{self.host}: credentials refused")
+        if status >= 400:
+            raise OnvifError(f"{self.host}: HTTP {status} {parse_fault(raw)}")
+        try:
+            return ET.fromstring(raw)
+        except ET.ParseError as err:
+            raise OnvifError(f"{self.host}: invalid XML ({err})") from err
+
+    async def async_update_time_offset(self) -> timedelta:
+        """Read the device clock; WS-Security tokens are checked against it."""
+        root = await self._call(
+            self.service_url("device"),
+            f'<GetSystemDateAndTime xmlns="{NS_DEVICE}"/>',
+            auth=False,
+        )
+        utc = find(root, "UTCDateTime")
+        if utc is not None:
+            date, time = find(utc, "Date"), find(utc, "Time")
+            try:
+                device = datetime(
+                    int(find_text(date, "Year")),
+                    int(find_text(date, "Month")),
+                    int(find_text(date, "Day")),
+                    int(find_text(time, "Hour")),
+                    int(find_text(time, "Minute")),
+                    int(find_text(time, "Second")),
+                    tzinfo=UTC,
+                )
+            except ValueError:
+                return self._offset
+            self._offset = device - datetime.now(UTC)
+        return self._offset
+
+    async def async_get_services(self) -> dict[str, str]:
+        """Read the service endpoints."""
+        root = await self._call(
+            self.service_url("device"),
+            f'<GetServices xmlns="{NS_DEVICE}"><IncludeCapability>false'
+            "</IncludeCapability></GetServices>",
+        )
+        for svc in find_all(root, "Service"):
+            name = SERVICES.get(find_text(svc, "Namespace"))
+            if name and (xaddr := find_text(svc, "XAddr")):
+                self.services[name] = self._same_host(xaddr)
+        return self.services
+
+    async def async_get_identity(self) -> DeviceIdentity:
+        """Read manufacturer, model, firmware and serial number."""
+        root = await self._call(
+            self.service_url("device"), f'<GetDeviceInformation xmlns="{NS_DEVICE}"/>'
+        )
+        return DeviceIdentity(
+            manufacturer=find_text(root, "Manufacturer"),
+            model=find_text(root, "Model"),
+            firmware=find_text(root, "FirmwareVersion"),
+            serial=find_text(root, "SerialNumber"),
+        )
+
+    async def async_get_mac(self) -> str | None:
+        """Read the MAC address of the first network interface."""
+        root = await self._call(
+            self.service_url("device"), f'<GetNetworkInterfaces xmlns="{NS_DEVICE}"/>'
+        )
+        return find_text(root, "HwAddress").lower() or None
+
+    async def async_get_profiles(self) -> list[MediaProfile]:
+        """Read the media profiles, with Media2 first and Media1 as a fallback."""
+        try:
+            root = await self._call(
+                self.service_url("media2"),
+                f'<GetProfiles xmlns="{NS_MEDIA2}"><Type>All</Type></GetProfiles>',
+            )
+        except OnvifAuthError:
+            raise
+        except OnvifError as err:
+            _LOGGER.debug("%s: Media2 GetProfiles failed (%s), trying Media1", self.host, err)
+            root = await self._call(self.service_url("media"), f'<GetProfiles xmlns="{NS_MEDIA}"/>')
+        return parse_profiles(root)
+
+    async def async_get_stream_uri(self, token: str) -> str:
+        """Return the RTSP URI of a profile."""
+        try:
+            root = await self._call(
+                self.service_url("media2"),
+                f'<GetStreamUri xmlns="{NS_MEDIA2}"><Protocol>RTSP</Protocol>'
+                f"<ProfileToken>{escape(token)}</ProfileToken></GetStreamUri>",
+            )
+        except OnvifAuthError:
+            raise
+        except OnvifError:
+            root = await self._call(
+                self.service_url("media"),
+                f'<GetStreamUri xmlns="{NS_MEDIA}"><StreamSetup><tt:Stream>RTP-Unicast'
+                "</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol>"
+                "</tt:Transport></StreamSetup>"
+                f"<ProfileToken>{escape(token)}</ProfileToken></GetStreamUri>",
+            )
+        if not (uri := find_text(root, "Uri")):
+            raise OnvifError(f"{self.host}: no stream URI for profile {token}")
+        return uri
+
+    async def async_get_snapshot_uri(self, token: str) -> str | None:
+        """Return the JPEG snapshot URI of a profile, if the device has one."""
+        try:
+            root = await self._call(
+                self.service_url("media2"),
+                f'<GetSnapshotUri xmlns="{NS_MEDIA2}">'
+                f"<ProfileToken>{escape(token)}</ProfileToken></GetSnapshotUri>",
+            )
+        except OnvifAuthError:
+            raise
+        except OnvifError:
+            return None
+        return find_text(root, "Uri") or None
+
+    async def async_get_topics(self) -> list[str]:
+        """Read the event topics the device can send."""
+        root = await self._call(
+            self.service_url("events"), f'<GetEventProperties xmlns="{NS_EVENTS}"/>'
+        )
+        return parse_topics(root)
+
+    async def async_create_pullpoint(self, seconds: int) -> PullPoint:
+        """Create a PullPoint subscription that lives for this many seconds."""
+        root = await self._call(
+            self.service_url("events"),
+            f'<CreatePullPointSubscription xmlns="{NS_EVENTS}"><InitialTerminationTime>'
+            f"PT{seconds}S</InitialTerminationTime></CreatePullPointSubscription>",
+        )
+        address = find_text(find(root, "SubscriptionReference"), "Address")
+        if not address:
+            raise OnvifError(f"{self.host}: subscription without an address")
+        return PullPoint(self._same_host(address))
+
+    async def async_set_synchronization_point(self, pullpoint: PullPoint) -> None:
+        """Ask the device to resend the current value of every property."""
+        await self._call(
+            pullpoint.address,
+            f'<SetSynchronizationPoint xmlns="{NS_EVENTS}"/>',
+            action=ACTION_SYNC,
+        )
+
+    async def async_pull(
+        self, pullpoint: PullPoint, wait: int = 10, limit: int = 64
+    ) -> list[OnvifEvent]:
+        """Long-poll the PullPoint: return as soon as events arrive, or after wait."""
+        root = await self._call(
+            pullpoint.address,
+            f'<PullMessages xmlns="{NS_EVENTS}"><Timeout>PT{wait}S</Timeout>'
+            f"<MessageLimit>{limit}</MessageLimit></PullMessages>",
+            action=ACTION_PULL,
+            timeout=wait + 10,
+        )
+        return parse_notifications(root)
+
+    async def async_renew(self, pullpoint: PullPoint, seconds: int) -> None:
+        """Extend the subscription."""
+        await self._call(
+            pullpoint.address,
+            f'<Renew xmlns="{NS_WSNT}"><TerminationTime>PT{seconds}S</TerminationTime></Renew>',
+            action=ACTION_RENEW,
+        )
+
+    async def async_unsubscribe(self, pullpoint: PullPoint) -> None:
+        """End the subscription so the device frees it."""
+        await self._call(
+            pullpoint.address,
+            f'<Unsubscribe xmlns="{NS_WSNT}"/>',
+            action=ACTION_UNSUBSCRIBE,
+            timeout=5,
+        )
+
+    async def async_get_bytes(self, url: str) -> bytes:
+        """Fetch a URL from the device (snapshots) with HTTP Digest."""
+        try:
+            async with self._session.get(
+                self._same_host(url),
+                timeout=aiohttp.ClientTimeout(total=10),
+                middlewares=(self._digest,),
+            ) as resp:
+                if resp.status == 401:
+                    raise OnvifAuthError(f"{self.host}: snapshot refused")
+                if resp.status >= 400:
+                    raise OnvifError(f"{self.host}: snapshot HTTP {resp.status}")
+                return await resp.read()
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise OnvifConnectionError(f"{self.host}: {err or type(err).__name__}") from err

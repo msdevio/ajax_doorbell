@@ -1,0 +1,45 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "ringing": {
+        "default": "mdi:bell-outline",
+        "state": { "on": "mdi:bell-ring" }
+      },
+      "person": {
+        "default": "mdi:account-outline",
+        "state": { "on": "mdi:account" }
+      },
+      "vehicle": {
+        "default": "mdi:car-outline",
+        "state": { "on": "mdi:car" }
+      },
+      "pet": {
+        "default": "mdi:paw-outline",
+        "state": { "on": "mdi:paw" }
+      }
+    },
+    "camera": {
+      "substream": { "default": "mdi:doorbell-video" }
+    },
+    "event": {
+      "ring": { "default": "mdi:doorbell" }
+    },
+    "sensor": {
+      "call_state": {
+        "default": "mdi:phone-hangup",
+        "state": {
+          "ringing": "mdi:phone-ring",
+          "in_call": "mdi:phone-in-talk"
+        }
+      },
+      "last_ring": { "default": "mdi:bell-ring-outline" },
+      "missed_calls": { "default": "mdi:phone-missed" }
+    }
+  },
+  "services": {
+    "answer": { "service": "mdi:phone" },
+    "hang_up": { "service": "mdi:phone-hangup" },
+    "dismiss": { "service": "mdi:bell-off" },
+    "clear_missed": { "service": "mdi:phone-check" }
+  }
+}

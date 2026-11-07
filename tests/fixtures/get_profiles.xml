@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+<SOAP-ENV:Body><tr2:GetProfilesResponse>
+<tr2:Profiles token="main_token" fixed="true"><tr2:Name>Mainstream</tr2:Name><tr2:Configurations>
+<tr2:VideoSource token="vs"><tt:Name>vs</tt:Name></tr2:VideoSource>
+<tr2:AudioSource token="as"><tt:Name>as</tt:Name></tr2:AudioSource>
+<tr2:VideoEncoder token="ve0" GovLength="25" Profile="Main"><tt:Name>ve0</tt:Name><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>2688</tt:Width><tt:Height>1520</tt:Height></tt:Resolution><tt:RateControl ConstantBitRate="false"><tt:FrameRateLimit>25</tt:FrameRateLimit><tt:BitrateLimit>2048</tt:BitrateLimit></tt:RateControl></tr2:VideoEncoder>
+<tr2:AudioEncoder token="ae0"><tt:Name>ae0</tt:Name><tt:Encoding>G722</tt:Encoding><tt:Bitrate>64</tt:Bitrate><tt:SampleRate>16</tt:SampleRate></tr2:AudioEncoder>
+<tr2:AudioOutput token="ao0"><tt:Name>ao0</tt:Name><tt:OutputToken>out0</tt:OutputToken><tt:OutputLevel>80</tt:OutputLevel></tr2:AudioOutput>
+<tr2:AudioDecoder token="ad0"><tt:Name>ad0</tt:Name></tr2:AudioDecoder>
+</tr2:Configurations></tr2:Profiles>
+<tr2:Profiles token="sub_token" fixed="true"><tr2:Name>Substream</tr2:Name><tr2:Configurations>
+<tr2:VideoEncoder token="ve1" GovLength="25" Profile="Main"><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>1024</tt:Width><tt:Height>576</tt:Height></tt:Resolution><tt:RateControl><tt:FrameRateLimit>15</tt:FrameRateLimit><tt:BitrateLimit>512</tt:BitrateLimit></tt:RateControl></tr2:VideoEncoder>
+</tr2:Configurations></tr2:Profiles>
+</tr2:GetProfilesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>
