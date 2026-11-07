@@ -12,7 +12,15 @@ from homeassistant.core import HomeAssistant
 from . import AjaxDoorbellConfigEntry
 from .rtsp import strip_credentials
 
-TO_REDACT = {CONF_PASSWORD, CONF_USERNAME, "serial", "mac", "unique_id"}
+TO_REDACT = {
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    "nvr_password",
+    "nvr_username",
+    "serial",
+    "mac",
+    "unique_id",
+}
 
 
 def _hide_mac(uri: str, mac: str | None) -> str:
@@ -71,5 +79,15 @@ async def async_get_config_entry_diagnostics(
             "missed_calls": call.missed_calls,
         },
         "detections": doorbell.detections.state,
+        "nvr": {
+            "configured": doorbell.nvr_configured,
+            "connected": doorbell.nvr is not None,
+            "error": doorbell.nvr_error,
+            "recordings": {
+                quality: _hide_mac(recording.token, doorbell.mac)
+                for quality, recording in (doorbell.nvr.recordings if doorbell.nvr else {}).items()
+            },
+            "visits": len(doorbell.visits.visits),
+        },
         "last_events": list(doorbell.last_events),
     }

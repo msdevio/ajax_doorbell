@@ -34,7 +34,7 @@
  * it the card still shows the video and plays the sound.
  */
 
-const CARD_VERSION = "0.1.1";
+const CARD_VERSION = "0.2.0";
 const DOMAIN = "ajax_doorbell";
 
 const KEEPALIVE_MS = 60000; // re-answer during our call: the integration ends unattended calls
@@ -49,6 +49,7 @@ const FLASH_MS = 3500;
 const RING_REPEAT_MS = 3000;
 const FS_FALLBACK_MS = 1000;
 const TALK_READY_MS = 8000;
+const REPLAY_LEAD_MS = 5000; // a visit is replayed from a little before it started
 
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -278,6 +279,11 @@ const ICONS = {
   retry: "mdi:refresh",
   alert: "mdi:alert-circle-outline",
   doorbell: "mdi:doorbell-video",
+  history: "mdi:history",
+  person: "mdi:walk",
+  rewind: "mdi:rewind-10",
+  forward: "mdi:fast-forward-10",
+  live: "mdi:access-point",
 };
 
 const STRINGS = {
@@ -320,6 +326,18 @@ const STRINGS = {
     mic_unsupported: "Ce navigateur ne donne pas accès au micro.",
     mic_failed: "Micro indisponible ({name}).",
     mic_taken: "Le micro a été repris sur un autre écran.",
+    visits_title: "Dernières visites",
+    visit_ring: "Sonnerie",
+    visit_person: "Passage",
+    replay: "Relecture",
+    back_live: "Direct",
+    rewind: "Reculer de 10 s",
+    forward: "Avancer de 10 s",
+    nvr_unreachable: "NVR injoignable",
+    no_visits: "Aucune visite ces derniers jours.",
+    yesterday: "hier",
+    replay_failed: "Relecture impossible : {message}",
+    replay_in_call: "Raccroche pour revoir une visite.",
     mic_ended: "La sonnette a coupé le micro.",
     mic_relay: "La sonnette refuse le micro : {message}",
     err_ice: "Impossible de joindre la sonnette (réseau).",
@@ -380,6 +398,18 @@ const STRINGS = {
     mic_unsupported: "This browser gives no access to the microphone.",
     mic_failed: "Microphone unavailable ({name}).",
     mic_taken: "Another screen took the microphone.",
+    visits_title: "Recent visits",
+    visit_ring: "Ring",
+    visit_person: "Someone",
+    replay: "Replay",
+    back_live: "Live",
+    rewind: "Back 10 s",
+    forward: "Forward 10 s",
+    nvr_unreachable: "NVR unreachable",
+    no_visits: "No visits in the last days.",
+    yesterday: "yesterday",
+    replay_failed: "Replay failed: {message}",
+    replay_in_call: "Hang up to replay a visit.",
     mic_ended: "The doorbell closed the microphone.",
     mic_relay: "The doorbell refused the microphone: {message}",
     err_ice: "Can't reach the doorbell (network).",
@@ -931,6 +961,74 @@ const STYLE = `
     color: var(--secondary-text-color, #727272);
   }
   .hint.show { display: flex; }
+
+  /* ---------- recent visits (replayed from the NVR) ---------- */
+  .visits { display: none; padding: 0 12px 12px; }
+  .visits.show { display: block; }
+  .visits-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 4px 8px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--secondary-text-color, #727272);
+  }
+  .visits-head ha-icon { --mdc-icon-size: 18px; }
+  .visits-note { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--warning-color, #ffa600); }
+  .visits-strip {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+    padding-bottom: 4px;
+    scrollbar-width: thin;
+  }
+  .visit {
+    flex: 0 0 auto;
+    width: 128px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    scroll-snap-align: start;
+  }
+  .visit:disabled { cursor: default; opacity: 0.6; }
+  .visit .thumb {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 128px;
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+    border-radius: 10px;
+    background: var(--secondary-background-color, #e5e5e5);
+  }
+  .visit img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .visit .empty-thumb { --mdc-icon-size: 28px; color: var(--disabled-text-color, #bdbdbd); }
+  .visit .kind {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    padding: 3px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    --mdc-icon-size: 14px;
+  }
+  .visit .kind.ring { background: var(--primary-color, #03a9f4); }
+  .visit .when { margin-top: 4px; font-size: 12px; color: var(--primary-text-color); }
+  .visit .what { font-size: 11px; color: var(--secondary-text-color, #727272); }
+  .visit.current .thumb, .visit:focus-visible .thumb {
+    outline: 2px solid var(--primary-color, #03a9f4);
+    outline-offset: -2px;
+  }
+  .visits-empty { padding: 4px; font-size: 12px; color: var(--secondary-text-color, #727272); }
+  .badge.replay .dot { background: var(--warning-color, #ffa600); }
   .hint ha-icon { --mdc-icon-size: 18px; flex: 0 0 auto; color: var(--warning-color, #ffa600); }
 
   /* ---------- incoming call ---------- */
@@ -1150,6 +1248,13 @@ const TEMPLATE = `
       <div class="hint" id="hint" role="status"
         ><ha-icon icon="${ICONS.micOff}"></ha-icon><span id="hint-text"></span
       ></div>
+      <div class="visits" id="visits">
+        <div class="visits-head"
+          ><ha-icon icon="${ICONS.history}"></ha-icon><span id="visits-title"></span
+          ><span class="visits-note" id="visits-note"></span
+        ></div>
+        <div class="visits-strip" id="visits-strip"></div>
+      </div>
       <div class="ring" id="ring" role="dialog" aria-modal="false" aria-labelledby="ring-title" aria-describedby="ring-sub">
         <div class="ring-head">
           <div class="bell" aria-hidden="true">
@@ -1263,6 +1368,14 @@ class AjaxDoorbellCard extends HTMLElement {
     this._isPreview = false;
     this._built = false;
     this._els = {};
+    this._visits = null; // {visits, nvr, nvr_configured, replay_camera} from the integration
+    this._visitsSub = null;
+    this._visitsFor = null;
+    this._visitsReq = 0;
+    this._visitsKey = null;
+    this._thumbs = new Map(); // visit id -> signed thumbnail URL, kept while listed
+    this._replay = null; // {camera, start, visitId, began, playing}
+    this._replayReq = 0;
     this._ctrl = {};
     this._controlsKey = null;
     this._centerKey = null;
@@ -1432,6 +1545,7 @@ class AjaxDoorbellCard extends HTMLElement {
     debug("card removed: cleaning up");
     if (this._ownCall) this._hangUp();
     else this._teardown();
+    this._stopVisits();
     this._stopRingtone();
     this._clearAllTimers();
     if (this._audioCtx) {
@@ -1611,6 +1725,7 @@ class AjaxDoorbellCard extends HTMLElement {
   _update() {
     if (!this._config || !this._hass || !this._built) return;
     this._syncCall();
+    this._ensureVisits();
     if (this._needsCaps() && !this._capsPromise) this._loadCaps();
     this._render();
   }
@@ -1687,6 +1802,7 @@ class AjaxDoorbellCard extends HTMLElement {
 
   _answer() {
     if (!this._config || !this._hass || !this._stateObj()) return;
+    this._leaveReplay();
     this._unlockMedia();
     this._stopRingtone();
     if (this._call.state === "ringing") this._ringAck = this._ringKey();
@@ -1724,6 +1840,7 @@ class AjaxDoorbellCard extends HTMLElement {
 
   _view() {
     if (!this._config || !this._hass || !this._stateObj() || this._mode === "talk") return;
+    this._leaveReplay();
     this._unlockMedia();
     this._stopRingtone();
     if (this._call.state === "ringing") this._ringAck = this._ringKey();
@@ -1835,6 +1952,192 @@ class AjaxDoorbellCard extends HTMLElement {
     this._answer();
   }
 
+  /* ---------- recent visits, replayed from the NVR ---------- */
+
+  _ensureVisits() {
+    const camera = this._config.camera;
+    if (this._visitsFor === camera || !this.isConnected || this._isPreview) return;
+    this._stopVisits();
+    const hass = this._hass;
+    const entry = hass.entities && hass.entities[camera];
+    const connection = hass.connection;
+    if (!entry || entry.platform !== DOMAIN || !connection || typeof connection.subscribeMessage !== "function") return;
+    this._visitsFor = camera;
+    const req = ++this._visitsReq;
+    connection
+      .subscribeMessage(
+        (msg) => {
+          if (req !== this._visitsReq) return;
+          this._visits = msg;
+          this._render();
+        },
+        { type: `${DOMAIN}/visits`, entity_id: camera }
+      )
+      .then((unsub) => {
+        if (req === this._visitsReq) this._visitsSub = unsub;
+        else Promise.resolve().then(unsub).catch(() => {});
+      })
+      .catch((err) => debug("visits unavailable:", (err && (err.message || err.code)) || err));
+  }
+
+  _stopVisits() {
+    this._visitsReq += 1;
+    const unsub = this._visitsSub;
+    this._visitsSub = null;
+    this._visitsFor = null;
+    this._visits = null;
+    this._visitsKey = null;
+    if (unsub) Promise.resolve().then(unsub).catch(() => {});
+  }
+
+  _visitTime(when) {
+    const date = when instanceof Date ? when : new Date(when);
+    if (Number.isNaN(date.getTime())) return "";
+    const hass = this._hass;
+    const locale = (hass && ((hass.locale && hass.locale.language) || hass.language)) || undefined;
+    const time = date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+    const today = new Date();
+    const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+    if (date.toDateString() === today.toDateString()) return time;
+    if (date.toDateString() === yesterday.toDateString()) return `${this._t("yesterday")} ${time}`;
+    return `${date.toLocaleDateString(locale, { weekday: "short", day: "numeric" })} ${time}`;
+  }
+
+  _renderVisits() {
+    const els = this._els;
+    if (!els.visits) return;
+    const data = this._visits;
+    const show = Boolean(data && data.nvr_configured);
+    setClass(els.visits, show ? "visits show" : "visits");
+    if (!show) return;
+    setText(els.visitsTitle, this._t("visits_title"));
+    setText(els.visitsNote, data.nvr ? "" : this._t("nvr_unreachable"));
+    const current = this._mode === "replay" && this._replay ? this._replay.visitId : null;
+    const visits = data.visits || [];
+    const key = [this._lang(), data.nvr, current, ...visits.map((v) => `${v.id}:${v.kind}`)].join("|");
+    if (key === this._visitsKey) return;
+    this._visitsKey = key;
+    const listed = new Set(visits.map((v) => v.id));
+    [...this._thumbs.keys()].forEach((id) => listed.has(id) || this._thumbs.delete(id));
+    const strip = els.visitsStrip;
+    strip.textContent = "";
+    if (!visits.length) {
+      const empty = document.createElement("div");
+      empty.className = "visits-empty";
+      empty.textContent = this._t("no_visits");
+      strip.appendChild(empty);
+      return;
+    }
+    visits.forEach((visit) => {
+      // The first signed URL is kept: a new one each update would reload every image.
+      if (visit.thumb && !this._thumbs.has(visit.id)) this._thumbs.set(visit.id, visit.thumb);
+      const what = this._t(visit.kind === "ring" ? "visit_ring" : "visit_person");
+      const when = this._visitTime(visit.start);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = visit.id === current ? "visit current" : "visit";
+      button.disabled = !data.nvr;
+      button.setAttribute("aria-label", `${what} · ${when}`);
+      const thumb = document.createElement("div");
+      thumb.className = "thumb";
+      const url = data.nvr && this._thumbs.get(visit.id);
+      if (url) {
+        const img = document.createElement("img");
+        img.alt = "";
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.addEventListener("error", () => img.remove());
+        img.src = typeof this._hass.hassUrl === "function" ? this._hass.hassUrl(url) : url;
+        thumb.appendChild(img);
+      } else {
+        const icon = document.createElement("ha-icon");
+        icon.className = "empty-thumb";
+        icon.setAttribute("icon", ICONS.doorbell);
+        thumb.appendChild(icon);
+      }
+      const kind = document.createElement("ha-icon");
+      kind.className = visit.kind === "ring" ? "kind ring" : "kind";
+      kind.setAttribute("icon", visit.kind === "ring" ? ICONS.bell : ICONS.person);
+      thumb.appendChild(kind);
+      const whenEl = document.createElement("div");
+      whenEl.className = "when";
+      whenEl.textContent = when;
+      const whatEl = document.createElement("div");
+      whatEl.className = "what";
+      whatEl.textContent = what;
+      button.append(thumb, whenEl, whatEl);
+      button.addEventListener("click", () => this._replayAt(new Date(new Date(visit.start).getTime() - REPLAY_LEAD_MS), visit.id));
+      strip.appendChild(button);
+    });
+  }
+
+  /** Play the NVR's recording from a moment, on the integration's replay camera. */
+  async _replayAt(start, visitId) {
+    if (!this._hass || !this._config) return;
+    if (this._mode === "talk") {
+      this._flash(this._t("replay_in_call"));
+      return;
+    }
+    const latest = Date.now() - 2000;
+    const from = new Date(Math.min(start.getTime(), latest));
+    this._unlockMedia();
+    const req = ++this._replayReq;
+    let result;
+    try {
+      result = await this._hass.callWS({ type: `${DOMAIN}/replay`, entity_id: this._config.camera, start: from.toISOString() });
+    } catch (err) {
+      if (req === this._replayReq) this._flash(this._t("replay_failed", { message: (err && (err.message || err.code)) || err }));
+      return;
+    }
+    if (req !== this._replayReq || this._mode === "talk" || !result || !result.camera) return;
+    const keepVisit = visitId === undefined && this._replay ? this._replay.visitId : visitId;
+    this._closeSession();
+    this._replay = { camera: result.camera, start: from, visitId: keepVisit, began: Date.now(), playing: 0 };
+    this._speakerOn = true;
+    this._soundBlocked = false;
+    this._retries = 0;
+    this._acquireWakeLock();
+    this._setInterval("clock", () => this._renderClock(), 1000);
+    this._connect("replay");
+    this._render();
+  }
+
+  _replayPosition() {
+    const replay = this._replay;
+    if (!replay) return null;
+    const played = replay.playing ? Date.now() - replay.playing : 0;
+    return new Date(replay.start.getTime() + played);
+  }
+
+  _replayLabel() {
+    const position = this._replayPosition();
+    if (!position) return this._t("replay");
+    const hass = this._hass;
+    const locale = (hass && ((hass.locale && hass.locale.language) || hass.language)) || undefined;
+    let time = position.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    if (position.toDateString() !== new Date().toDateString()) time = `${this._visitTime(position).split(" ")[0]} ${time}`;
+    return `${this._t("replay")} · ${time}`;
+  }
+
+  _replayJump(seconds) {
+    const position = this._replayPosition();
+    if (position) this._replayAt(new Date(position.getTime() + seconds * 1000));
+  }
+
+  _leaveReplay() {
+    if (this._mode !== "replay" && !this._replay) return;
+    this._replayReq += 1;
+    this._replay = null;
+    this._clearTimer("clock");
+    this._closeSession();
+    this._mode = "none";
+  }
+
+  _backToLive() {
+    this._leaveReplay();
+    this._view();
+  }
+
   /* ---------- WebRTC ---------- */
 
   async _connect(mode) {
@@ -1846,7 +2149,8 @@ class AjaxDoorbellCard extends HTMLElement {
       return;
     }
     const gen = ++this._gen;
-    const entityId = this._config.camera;
+    const replay = mode === "replay" && this._replay;
+    const entityId = replay ? this._replay.camera : this._config.camera;
     this._mode = mode;
     this._media = "connecting";
     this._errorText = "";
@@ -1867,7 +2171,7 @@ class AjaxDoorbellCard extends HTMLElement {
 
       const pc = new RTCPeerConnection((clientConfig && clientConfig.configuration) || {});
       this._pc = pc;
-      const talk = this._canTalk();
+      const talk = !replay && this._canTalk();
       // Audio first, then video, like Home Assistant's own player. With talk-back
       // through go2rtc the audio transceiver is sendrecv but carries no track yet:
       // answering swaps the microphone in with replaceTrack, without renegotiating.
@@ -2190,6 +2494,7 @@ class AjaxDoorbellCard extends HTMLElement {
     this._micError = null;
     this._pttDown = false;
     this._mode = "none";
+    this._replay = null;
     this._ownCall = false;
     this._callConfirmed = false;
     this._myLabel = null;
@@ -2847,6 +3152,10 @@ class AjaxDoorbellCard extends HTMLElement {
       controls: $("controls"),
       hint: $("hint"),
       hintText: $("hint-text"),
+      visits: $("visits"),
+      visitsTitle: $("visits-title"),
+      visitsNote: $("visits-note"),
+      visitsStrip: $("visits-strip"),
       ring: $("ring"),
       ringTitle: $("ring-title"),
       ringSub: $("ring-sub"),
@@ -2865,6 +3174,7 @@ class AjaxDoorbellCard extends HTMLElement {
     const onFrames = () => {
       if (this._pc && !this._videoReady && video.videoWidth > 0) {
         this._videoReady = true;
+        if (this._replay && !this._replay.playing) this._replay.playing = Date.now();
         this._render();
       }
     };
@@ -2904,10 +3214,11 @@ class AjaxDoorbellCard extends HTMLElement {
     els.stage.classList.toggle("has-video", this._videoReady && Boolean(this._pc));
 
     let badge = "";
-    if (live && this._mode !== "preview") badge = this._reconnecting ? "reconnecting" : "live";
+    if (live && this._mode === "replay") badge = "replay";
+    else if (live && this._mode !== "preview") badge = this._reconnecting ? "reconnecting" : "live";
     else if (st && st.state === "unavailable") badge = "unavailable";
     setClass(els.badge, badge ? `pill badge show ${badge}` : "pill badge");
-    setText(els.badgeText, badge ? this._t(badge) : "");
+    setText(els.badgeText, badge === "replay" ? this._replayLabel() : badge ? this._t(badge) : "");
     this._renderClock();
 
     let banner = null;
@@ -2947,7 +3258,15 @@ class AjaxDoorbellCard extends HTMLElement {
       setText(els.ringIgnoreLabel, this._t("ignore"));
     }
 
-    const screen = !st ? "missing" : this._mode === "talk" ? "call" : this._mode === "view" ? "view" : "idle";
+    const screen = !st
+      ? "missing"
+      : this._mode === "talk"
+        ? "call"
+        : this._mode === "view"
+          ? "view"
+          : this._mode === "replay"
+            ? "replay"
+            : "idle";
     const key = [
       screen,
       this._media === "error" ? "error" : "ok",
@@ -2965,11 +3284,13 @@ class AjaxDoorbellCard extends HTMLElement {
     const hint = this._mode === "talk" && talk && this._micError ? this._micErrorText() : "";
     setClass(els.hint, hint ? "hint show" : "hint");
     setText(els.hintText, hint);
+    this._renderVisits();
   }
 
   _renderClock() {
     const els = this._els;
     if (!els.timer) return;
+    if (this._mode === "replay" && this._media === "live") setText(els.badgeText, this._replayLabel());
     const show = this._mode === "talk";
     setClass(els.timer, show ? "pill timer show" : "pill timer");
     if (!show) return;
@@ -3049,6 +3370,17 @@ class AjaxDoorbellCard extends HTMLElement {
     if (screen === "idle") {
       add("view", { icon: ICONS.view, label: this._t("view"), cls: "wide", onClick: () => this._view() });
       answerButton();
+      return;
+    }
+    if (screen === "replay") {
+      if (!errored) {
+        add("rewind", { icon: ICONS.rewind, label: this._t("rewind"), iconOnly: true, onClick: () => this._replayJump(-10) });
+        add("forward", { icon: ICONS.forward, label: this._t("forward"), iconOnly: true, onClick: () => this._replayJump(10) });
+        speakerButton();
+        fullscreenButton();
+      }
+      add("live", { icon: ICONS.live, label: this._t("back_live"), cls: "wide", onClick: () => this._backToLive() });
+      add("close", { icon: ICONS.close, label: this._t("close"), onClick: () => this._close() });
       return;
     }
     if (screen === "view") {

@@ -50,16 +50,32 @@
   "options": {
     "step": {
       "init": {
-        "title": "Appels",
+        "title": "Appels et enregistrements",
         "data": {
-          "ring_duration": "Durée de sonnerie",
-          "call_timeout": "Durée maximale d'un appel"
+          "ring_duration": "Durée de la sonnerie",
+          "call_timeout": "Durée maximale d'un appel",
+          "nvr_host": "Adresse du NVR",
+          "nvr_port": "Port ONVIF du NVR",
+          "nvr_username": "Utilisateur ONVIF du NVR",
+          "nvr_password": "Mot de passe ONVIF du NVR",
+          "visit_retention": "Visites conservées"
         },
         "data_description": {
-          "ring_duration": "Temps pendant lequel une sonnerie attend une réponse avant de compter comme appel manqué.",
-          "call_timeout": "Un appel que personne ne raccroche se termine tout seul après ce délai."
+          "ring_duration": "Temps pendant lequel une sonnerie attend une réponse avant de compter comme manquée.",
+          "call_timeout": "Un appel que personne ne raccroche se termine seul après ce délai.",
+          "nvr_host": "Le NVR Ajax qui enregistre la DoorBell, pour y relire les visites. Rien n'est stocké dans Home Assistant. Laisse vide sans NVR.",
+          "nvr_port": "Port ONVIF du NVR (8080 par défaut).",
+          "nvr_username": "Laisse vide pour reprendre le compte ONVIF de la DoorBell.",
+          "nvr_password": "Laisse vide pour reprendre le compte ONVIF de la DoorBell.",
+          "visit_retention": "Nombre de jours de sonneries et de passages listés pour la relecture."
         }
       }
+    },
+    "error": {
+      "nvr_cannot_connect": "Le NVR ne répond pas à cette adresse.",
+      "nvr_invalid_auth": "Le NVR refuse ce compte ONVIF. Crée-le aussi sur le NVR (app Ajax, réglages du NVR, ONVIF).",
+      "nvr_not_nvr": "Cet appareil n'a pas d'enregistrements (ONVIF Profil G) : est-ce bien le NVR ?",
+      "nvr_no_recording": "Le NVR n'a aucun enregistrement de cette DoorBell."
     }
   },
   "entity": {
@@ -89,6 +105,9 @@
     "camera": {
       "substream": {
         "name": "Flux secondaire"
+      },
+      "replay": {
+        "name": "Relecture"
       }
     },
     "event": {

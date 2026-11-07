@@ -23,10 +23,17 @@ from homeassistant.util import dt as dt_util
 from .call import CallManager, CallState
 from .const import (
     CONF_CALL_TIMEOUT,
+    CONF_NVR_HOST,
+    CONF_NVR_PASSWORD,
+    CONF_NVR_PORT,
+    CONF_NVR_USERNAME,
     CONF_RING_DURATION,
+    CONF_VISIT_RETENTION,
     DEFAULT_CALL_TIMEOUT,
+    DEFAULT_ONVIF_PORT,
     DEFAULT_RING_DURATION,
     DEFAULT_RTSP_PORT,
+    DEFAULT_VISIT_RETENTION,
     DETECTION_HOLD,
     DOMAIN,
     MANUFACTURER,
@@ -39,6 +46,7 @@ from .const import (
     TOPIC_TRACKING,
 )
 from .events import EventStream
+from .nvr import AjaxNvr, NvrError
 from .onvif import (
     AjaxOnvifClient,
     DeviceIdentity,
@@ -50,6 +58,7 @@ from .onvif import (
 )
 from .rtsp import RtspError, SdpMedia, StreamDescription, async_describe
 from .talk import TALK_ENCODINGS, TalkSession
+from .visits import VisitLog
 
 if TYPE_CHECKING:
     from homeassistant.components.camera import Camera
@@ -191,6 +200,16 @@ class AjaxDoorbell:
             entry.options.get(CONF_CALL_TIMEOUT, DEFAULT_CALL_TIMEOUT),
         )
         self.detections = Detections(hass)
+        self.visits = VisitLog(
+            hass,
+            entry.entry_id,
+            int(entry.options.get(CONF_VISIT_RETENTION, DEFAULT_VISIT_RETENTION)),
+        )
+        self.nvr: AjaxNvr | None = None
+        self.nvr_error: str | None = None
+        self._nvr_task: asyncio.Task | None = None
+        self.replay_start: datetime | None = None
+        self._replay_listeners: list[Callable[[], None]] = []
         self.events = EventStream(
             hass,
             self.client,
@@ -239,6 +258,7 @@ class AjaxDoorbell:
         except OnvifError as err:
             _LOGGER.debug("GetEventProperties failed: %s", err)
         self.events.topics = self.subscription_topics
+        await self.visits.async_load()
         await self.async_probe_backchannel()
 
     async def async_probe_backchannel(self) -> None:
@@ -266,13 +286,21 @@ class AjaxDoorbell:
         )
 
     def start(self, entry: ConfigEntry) -> None:
-        """Start listening to events."""
+        """Start listening to events, and reach the NVR in the background."""
         self.events.start(entry)
+        if self.nvr_configured:
+            self._nvr_task = entry.async_create_background_task(
+                self.hass, self._async_connect_nvr(), "ajax_doorbell nvr"
+            )
 
     async def async_shutdown(self) -> None:
         """Stop everything."""
         if self._reprobe is not None:
             self._reprobe.cancel()
+        if self._nvr_task is not None:
+            self._nvr_task.cancel()
+        if self.nvr is not None:
+            await self.nvr.async_close()
         await self.events.async_stop()
         if self.talk is not None:
             await self.async_stop_talk(self.talk, "unloaded")
@@ -379,6 +407,60 @@ class AjaxDoorbell:
             except Exception as err:
                 _LOGGER.debug("go2rtc could not grab a frame: %s", err)
         return None
+
+    # ------------------------------------------------------------------- NVR
+
+    @property
+    def nvr_configured(self) -> bool:
+        """Return True when the options name an NVR."""
+        return bool(self.entry.options.get(CONF_NVR_HOST))
+
+    async def _async_connect_nvr(self) -> None:
+        """Reach the NVR; retry slowly while it is away (it may be unplugged)."""
+        options, data = self.entry.options, self.entry.data
+        delay = 60
+        while True:
+            nvr = AjaxNvr(
+                self.hass,
+                options[CONF_NVR_HOST],
+                int(options.get(CONF_NVR_PORT) or DEFAULT_ONVIF_PORT),
+                options.get(CONF_NVR_USERNAME) or data[CONF_USERNAME],
+                options.get(CONF_NVR_PASSWORD) or data[CONF_PASSWORD],
+                self.mac,
+            )
+            try:
+                await nvr.async_initialize()
+            except (OnvifError, NvrError, OSError) as err:
+                await nvr.async_close()
+                if self.nvr_error is None:
+                    _LOGGER.warning("%s: recordings unavailable: %s", self.entry.title, err)
+                self.nvr_error = str(err)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 900)
+                continue
+            self.nvr, self.nvr_error = nvr, None
+            _LOGGER.info("%s: recordings available from the NVR %s", self.entry.title, nvr.host)
+            self._notify_replay()
+            return
+
+    @callback
+    def async_add_replay_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        """Call listener when the NVR becomes available or the replay moves."""
+        self._replay_listeners.append(listener)
+        return lambda: self._replay_listeners.remove(listener)
+
+    @callback
+    def _notify_replay(self) -> None:
+        for listener in list(self._replay_listeners):
+            listener()
+
+    @callback
+    def set_replay(self, start: datetime) -> None:
+        """Point the replay camera at a moment of the recordings."""
+        if self.nvr is None:
+            raise NvrError("the NVR is not available")
+        self.replay_start = start
+        self._notify_replay()
 
     # ------------------------------------------------------------------- talk
 
@@ -523,8 +605,11 @@ class AjaxDoorbell:
         elif _matches(topic, TOPIC_OBJECT):
             raw = _value(data, "ClassTypes", "ClassType") or ""
             found = {_OBJECT_CLASSES.get(c.strip().lower()) for c in raw.split(",")}
+            someone = self.detections.state["person"]
             for key in ("person", "vehicle", "pet"):
                 self.detections.set(key, key in found, source)
+            if self.detections.state["person"] and not someone and event.operation != "Initialized":
+                self.visits.add("person")
         elif topic not in self._unhandled:
             self._unhandled.add(topic)
             _LOGGER.debug("Unhandled event topic %s: %s", event.topic, data)
@@ -545,6 +630,7 @@ class AjaxDoorbell:
             return
         self._last_ring = now
         self.call.ring()
+        self.visits.add("ring")
         for listener in list(self._ring_listeners):
             listener()
         delay = ""

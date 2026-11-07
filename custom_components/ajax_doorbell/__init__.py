@@ -26,6 +26,7 @@ from .doorbell import AjaxDoorbell
 from .onvif import OnvifAuthError, OnvifError
 from .services import async_setup_services
 from .talk import websocket_talk
+from .visits_api import VisitThumbnailView, websocket_replay, websocket_visits
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.CAMERA, Platform.EVENT, Platform.SENSOR]
 CARD_FILE = Path(__file__).parent / "frontend" / "ajax-doorbell-card.js"
@@ -39,6 +40,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register the services, the talk command and the intercom card once."""
     async_setup_services(hass)
     websocket_api.async_register_command(hass, websocket_talk)
+    websocket_api.async_register_command(hass, websocket_visits)
+    websocket_api.async_register_command(hass, websocket_replay)
+    if hass.http is not None:
+        hass.http.register_view(VisitThumbnailView())
     await _async_register_card(hass)
     return True
 

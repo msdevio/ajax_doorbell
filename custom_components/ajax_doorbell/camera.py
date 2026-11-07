@@ -27,9 +27,11 @@ async def async_setup_entry(
     """Add the main stream camera, plus the substream (disabled by default)."""
     doorbell = entry.runtime_data
     assert doorbell.main_profile is not None
-    entities = [AjaxDoorbellCamera(doorbell, doorbell.main_profile, main=True)]
+    entities: list[Camera] = [AjaxDoorbellCamera(doorbell, doorbell.main_profile, main=True)]
     if doorbell.sub_profile is not None:
         entities.append(AjaxDoorbellCamera(doorbell, doorbell.sub_profile, main=False))
+    if doorbell.nvr_configured:
+        entities.append(AjaxReplayCamera(doorbell))
     async_add_entities(entities)
 
 
@@ -97,3 +99,57 @@ class AjaxDoorbellCamera(AjaxDoorbellEntity, Camera):
     ) -> bytes | None:
         """Return a still image."""
         return await self._doorbell.async_snapshot(self, width, height)
+
+
+class AjaxReplayCamera(AjaxDoorbellEntity, Camera):
+    """The DoorBell's recordings, replayed from the NVR at the moment the card picks.
+
+    Nothing is stored: go2rtc plays the NVR's recording through the
+    integration's local relay, as it plays the live stream.
+    """
+
+    _attr_supported_features = CameraEntityFeature.STREAM
+    _attr_translation_key = "replay"
+    _attr_entity_registry_visible_default = False
+
+    def __init__(self, doorbell: AjaxDoorbell) -> None:
+        """Initialize the replay camera."""
+        AjaxDoorbellEntity.__init__(self, doorbell, "replay")
+        Camera.__init__(self)
+        self._attr_brand = "Ajax"
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the NVR and the moment being replayed."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self._doorbell.async_add_replay_listener(self._replay_changed))
+
+    @callback
+    def _replay_changed(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Return True once the NVR answers."""
+        return self._doorbell.nvr is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        """Return the moment being replayed."""
+        start = self._doorbell.replay_start
+        return {"replay_start": start.isoformat() if start else None}
+
+    async def stream_source(self) -> str | None:
+        """Return the local relay URL of the recording at the chosen moment."""
+        nvr, start = self._doorbell.nvr, self._doorbell.replay_start
+        if nvr is None or start is None:
+            return None
+        return nvr.replay_url(start)
+
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        """Return the recording's image at the chosen moment."""
+        nvr, start = self._doorbell.nvr, self._doorbell.replay_start
+        if nvr is None or start is None:
+            return None
+        return await nvr.async_thumbnail(start)

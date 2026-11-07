@@ -28,6 +28,9 @@ official ONVIF and RTSP interface: no Ajax cloud, no Ajax account password.
 - **Detections**: camera motion, PIR motion, and person, vehicle and animal from the
   DoorBell's AI. The subscription asks only for these topics, which keeps the
   DoorBell's live object tracking (several messages a second) off the network.
+- **Recent visits from the Ajax NVR**: rings and people at the door are listed in the
+  card for the last days, and replayed (video and sound) straight from the NVR, from
+  5 s before. Nothing is stored in Home Assistant: only the times are kept.
 - **Intercom card** `custom:ajax-doorbell-card` and a **notification blueprint**
   (Answer, View, Ignore, Open the door).
 - DHCP discovery, reauthentication, reconfiguration, diagnostics, English and French.
@@ -74,6 +77,7 @@ address and the ONVIF user.
 | `binary_sensor.<doorbell>_pir_motion` | Motion seen by the PIR sensor |
 | `binary_sensor.<doorbell>_person`, `_vehicle`, `_animal` | AI detections |
 | `binary_sensor.<doorbell>_event_stream` | Health of the ONVIF event subscription (diagnostic) |
+| `camera.<doorbell>_replay` | The NVR recording the card replays (hidden; only with an NVR) |
 
 ## Services
 
@@ -121,6 +125,22 @@ When it rings the card shows an incoming-call screen with **Answer**, **View** a
 is added. Answering on one screen shows "Answered on …" on the others. Opening the
 view with `?ajax_answer=1` (or `?ajax_answer=camera.ajax_doorbell` when there are
 several doorbells) answers at once: that is what the notification button uses.
+
+## Recordings from the Ajax NVR
+
+If an Ajax NVR records the DoorBell, open the integration's **Configure** and enter
+the NVR's address. It needs ONVIF on the NVR (Ajax app, NVR settings) with the same
+ONVIF user as the DoorBell, or another one given in the options.
+
+The card then shows **Recent visits**: each ring and each person detected at the
+door, for the number of days you choose (2 by default), with a picture. Tap one to
+replay it from 5 s before, with sound; **−10 s** and **+10 s** move in the
+recording, **Live** goes back to the doorbell.
+
+Nothing is recorded or stored by Home Assistant: the video stays on the NVR. A small
+relay inside the integration, on `127.0.0.1` only, lets Home Assistant's go2rtc play
+the NVR's recording, and pictures are taken from it when shown and kept in memory.
+This needs Home Assistant's built-in go2rtc (the default).
 
 ## Notification with an Answer button
 

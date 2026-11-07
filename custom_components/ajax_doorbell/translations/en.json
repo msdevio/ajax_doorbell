@@ -50,16 +50,32 @@
   "options": {
     "step": {
       "init": {
-        "title": "Calls",
+        "title": "Calls and recordings",
         "data": {
           "ring_duration": "Ring duration",
-          "call_timeout": "Maximum call length"
+          "call_timeout": "Maximum call length",
+          "nvr_host": "NVR address",
+          "nvr_port": "NVR ONVIF port",
+          "nvr_username": "NVR ONVIF user",
+          "nvr_password": "NVR ONVIF password",
+          "visit_retention": "Visits kept"
         },
         "data_description": {
           "ring_duration": "How long a ring waits for an answer before it counts as missed.",
-          "call_timeout": "A call nobody hangs up ends by itself after this time."
+          "call_timeout": "A call nobody hangs up ends by itself after this time.",
+          "nvr_host": "The Ajax NVR that records the DoorBell, to replay visits from it. Nothing is stored in Home Assistant. Leave empty without an NVR.",
+          "nvr_port": "ONVIF port of the NVR (8080 by default).",
+          "nvr_username": "Leave empty to use the DoorBell's ONVIF account.",
+          "nvr_password": "Leave empty to use the DoorBell's ONVIF account.",
+          "visit_retention": "How many days of rings and people stay listed for replay."
         }
       }
+    },
+    "error": {
+      "nvr_cannot_connect": "The NVR does not answer at this address.",
+      "nvr_invalid_auth": "The NVR refuses this ONVIF account. Create it on the NVR too (Ajax app, NVR settings, ONVIF).",
+      "nvr_not_nvr": "This device has no recordings (ONVIF Profile G): is it the NVR?",
+      "nvr_no_recording": "The NVR has no recording of this DoorBell."
     }
   },
   "entity": {
@@ -89,6 +105,9 @@
     "camera": {
       "substream": {
         "name": "Substream"
+      },
+      "replay": {
+        "name": "Replay"
       }
     },
     "event": {

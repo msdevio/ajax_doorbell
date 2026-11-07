@@ -16,6 +16,7 @@ from custom_components.ajax_doorbell.const import (
 from custom_components.ajax_doorbell.onvif import (
     OnvifAuthError,
     OnvifConnectionError,
+    Recording,
 )
 from homeassistant.config_entries import SOURCE_DHCP, SOURCE_USER
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
@@ -168,4 +169,66 @@ async def test_options(hass: HomeAssistant, mock_entry: MockConfigEntry) -> None
         result["flow_id"], {CONF_RING_DURATION: 45, CONF_CALL_TIMEOUT: 600}
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert mock_entry.options == {CONF_RING_DURATION: 45, CONF_CALL_TIMEOUT: 600}
+    assert mock_entry.options[CONF_RING_DURATION] == 45
+    assert mock_entry.options[CONF_CALL_TIMEOUT] == 600
+    assert mock_entry.options["visit_retention"] == 2
+    assert not mock_entry.options.get("nvr_host")
+
+
+@pytest.mark.parametrize(
+    ("services", "recordings", "error"),
+    [
+        ({"search": "s", "replay": "r"}, ["bcFhIz1NqO-9c756e123456-0-main-r"], None),
+        ({"media2": "m"}, [], "nvr_not_nvr"),
+        ({"search": "s", "replay": "r"}, ["a-0-main-r", "b-0-main-r"], "nvr_no_recording"),
+    ],
+)
+async def test_options_nvr(
+    hass: HomeAssistant,
+    mock_entry: MockConfigEntry,
+    mock_client: MagicMock,
+    services: dict[str, str],
+    recordings: list[str],
+    error: str | None,
+) -> None:
+    """An NVR address is checked: Profile G, and a recording of this DoorBell."""
+    mock_entry.add_to_hass(hass)
+    mock_client.async_get_services.return_value = services
+    mock_client.async_find_recordings = AsyncMock(
+        return_value=[Recording(token, "Sonnette", None, None) for token in recordings]
+    )
+    result = await hass.config_entries.options.async_init(mock_entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            CONF_RING_DURATION: 30,
+            CONF_CALL_TIMEOUT: 300,
+            "nvr_host": " 192.168.128.30 ",
+            "visit_retention": 2,
+        },
+    )
+    if error is None:
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert mock_entry.options["nvr_host"] == "192.168.128.30"
+    else:
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": error}
+
+
+async def test_options_nvr_refuses_the_account(
+    hass: HomeAssistant, mock_entry: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    """An NVR without the ONVIF user says so."""
+    mock_entry.add_to_hass(hass)
+    mock_client.async_get_services.side_effect = OnvifAuthError("no")
+    result = await hass.config_entries.options.async_init(mock_entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            CONF_RING_DURATION: 30,
+            CONF_CALL_TIMEOUT: 300,
+            "nvr_host": "192.168.128.30",
+            "visit_retention": 2,
+        },
+    )
+    assert result["errors"] == {"base": "nvr_invalid_auth"}

@@ -32,6 +32,10 @@ officielle ONVIF et RTSP : ni cloud Ajax, ni mot de passe du compte Ajax.
   et animal par l'IA de la DoorBell. L'abonnement ne demande que ces sujets, ce qui
   évite au réseau le suivi d'objets en direct de la DoorBell (plusieurs messages par
   seconde).
+- **Dernières visites depuis le NVR Ajax** : les sonneries et les personnes devant la
+  porte sont listées dans la carte sur les derniers jours, et relues (vidéo et son)
+  directement depuis le NVR, à partir de 5 s avant. Rien n'est stocké dans Home
+  Assistant : seules les heures sont gardées.
 - **Carte interphone** `custom:ajax-doorbell-card` et **blueprint de notification**
   (Décrocher, Voir, Ignorer, Ouvrir la porte).
 - Découverte DHCP, réauthentification, reconfiguration, diagnostics, français et
@@ -81,6 +85,7 @@ avec son adresse IP et l'utilisateur ONVIF.
 | `binary_sensor.<sonnette>_mouvement_pir` | Mouvement vu par le capteur PIR |
 | `binary_sensor.<sonnette>_personne`, `_vehicule`, `_animal` | Détections de l'IA |
 | `binary_sensor.<sonnette>_flux_d_evenements` | Santé de l'abonnement aux événements ONVIF (diagnostic) |
+| `camera.<sonnette>_relecture` | L'enregistrement du NVR que la carte relit (masquée ; seulement avec un NVR) |
 
 Les identifiants exacts dépendent du nom de l'appareil et de la langue de Home
 Assistant au moment de l'installation.
@@ -133,6 +138,25 @@ le micro s'ajoute. Décrocher sur un écran affiche « Décroché sur … » sur
 Ouvrir la vue avec `?ajax_answer=1` (ou `?ajax_answer=camera.ajax_doorbell` s'il y a
 plusieurs sonnettes) décroche aussitôt : c'est ce qu'utilise le bouton de la
 notification.
+
+## Enregistrements du NVR Ajax
+
+Si un NVR Ajax enregistre la DoorBell, ouvre **Configurer** sur l'intégration et
+indique l'adresse du NVR. Il faut l'ONVIF activé sur le NVR (app Ajax, réglages du
+NVR) avec le même utilisateur ONVIF que la DoorBell, ou un autre saisi dans les
+options.
+
+La carte affiche alors **Dernières visites** : chaque sonnerie et chaque personne
+détectée devant la porte, sur le nombre de jours choisi (2 par défaut), avec une
+image. Touche une visite pour la revoir à partir de 5 s avant, avec le son ;
+**−10 s** et **+10 s** se déplacent dans l'enregistrement, **Direct** revient à la
+sonnette.
+
+Home Assistant n'enregistre et ne stocke rien : la vidéo reste sur le NVR. Un petit
+relais dans l'intégration, sur `127.0.0.1` uniquement, permet au go2rtc de Home
+Assistant de lire l'enregistrement du NVR ; les images en sont tirées à l'affichage
+et gardées en mémoire. Il faut le go2rtc intégré à Home Assistant (le cas par
+défaut).
 
 ## Notification avec bouton Décrocher
 

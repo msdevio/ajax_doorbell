@@ -32,15 +32,22 @@ from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
 from .const import (
     CONF_CALL_TIMEOUT,
+    CONF_NVR_HOST,
+    CONF_NVR_PASSWORD,
+    CONF_NVR_PORT,
+    CONF_NVR_USERNAME,
     CONF_RING_DURATION,
+    CONF_VISIT_RETENTION,
     DEFAULT_CALL_TIMEOUT,
     DEFAULT_ONVIF_PORT,
     DEFAULT_RING_DURATION,
     DEFAULT_USERNAME,
+    DEFAULT_VISIT_RETENTION,
     DOMAIN,
     TOPIC_RING,
 )
 from .doorbell import normalize_topic
+from .nvr import NvrError, pick_recordings
 from .onvif import AjaxOnvifClient, DeviceIdentity, OnvifAuthError, OnvifError
 
 _LOGGER = logging.getLogger(__name__)
@@ -243,16 +250,57 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
+async def async_check_nvr(
+    hass: HomeAssistant, host: str, port: int, username: str, password: str, mac: str | None
+) -> str | None:
+    """Return an error key, or None when the NVR records this DoorBell."""
+    client = AjaxOnvifClient(async_get_clientsession(hass), host, port, username, password)
+    try:
+        await client.async_update_time_offset()
+        services = await client.async_get_services()
+        if not {"search", "replay"} <= services.keys():
+            return "nvr_not_nvr"
+        pick_recordings(await client.async_find_recordings(), mac)
+    except OnvifAuthError:
+        return "nvr_invalid_auth"
+    except OnvifError:
+        return "nvr_cannot_connect"
+    except NvrError:
+        return "nvr_no_recording"
+    return None
+
+
 class AjaxDoorbellOptionsFlow(OptionsFlowWithReload):
-    """Ring and call timings; saving them reloads the DoorBell."""
+    """Call timings and the NVR; saving them reloads the DoorBell."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Show the options."""
+        errors: dict[str, str] = {}
+        entry = self.config_entry
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
-        options = self.config_entry.options
+            if host := (user_input.get(CONF_NVR_HOST) or "").strip():
+                user_input[CONF_NVR_HOST] = host
+                mac = getattr(getattr(entry, "runtime_data", None), "mac", None)
+                if error := await async_check_nvr(
+                    self.hass,
+                    host,
+                    int(user_input.get(CONF_NVR_PORT) or DEFAULT_ONVIF_PORT),
+                    user_input.get(CONF_NVR_USERNAME) or entry.data[CONF_USERNAME],
+                    user_input.get(CONF_NVR_PASSWORD) or entry.data[CONF_PASSWORD],
+                    mac,
+                ):
+                    errors["base"] = error
+            if not errors:
+                return self.async_create_entry(data=user_input)
+        options = {**entry.options, **(user_input or {})}
+
+        def suggested(key: str) -> dict[str, Any]:
+            value = options.get(key)
+            return {"suggested_value": value} if value not in (None, "") else {}
+
         return self.async_show_form(
             step_id="init",
+            errors=errors,
             data_schema=vol.Schema(
                 {
                     vol.Required(
@@ -276,6 +324,32 @@ class AjaxDoorbellOptionsFlow(OptionsFlowWithReload):
                             max=1800,
                             step=30,
                             unit_of_measurement="s",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_NVR_HOST, description=suggested(CONF_NVR_HOST)
+                    ): TextSelector(),
+                    vol.Optional(
+                        CONF_NVR_PORT, default=options.get(CONF_NVR_PORT, DEFAULT_ONVIF_PORT)
+                    ): NumberSelector(
+                        NumberSelectorConfig(min=1, max=65535, mode=NumberSelectorMode.BOX)
+                    ),
+                    vol.Optional(
+                        CONF_NVR_USERNAME, description=suggested(CONF_NVR_USERNAME)
+                    ): TextSelector(),
+                    vol.Optional(
+                        CONF_NVR_PASSWORD, description=suggested(CONF_NVR_PASSWORD)
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+                    vol.Required(
+                        CONF_VISIT_RETENTION,
+                        default=options.get(CONF_VISIT_RETENTION, DEFAULT_VISIT_RETENTION),
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=1,
+                            max=30,
+                            step=1,
+                            unit_of_measurement="d",
                             mode=NumberSelectorMode.BOX,
                         )
                     ),

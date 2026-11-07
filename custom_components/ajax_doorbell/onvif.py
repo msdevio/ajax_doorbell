@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -31,6 +32,8 @@ NS_MEDIA = "http://www.onvif.org/ver10/media/wsdl"
 NS_MEDIA2 = "http://www.onvif.org/ver20/media/wsdl"
 NS_EVENTS = "http://www.onvif.org/ver10/events/wsdl"
 NS_WSNT = "http://docs.oasis-open.org/wsn/b-2"
+NS_SEARCH = "http://www.onvif.org/ver10/search/wsdl"
+NS_REPLAY = "http://www.onvif.org/ver10/replay/wsdl"
 
 SERVICES = {
     NS_DEVICE: "device",
@@ -126,6 +129,41 @@ class PullPoint:
     # WS-Addressing reference parameters the device wants echoed in every
     # request to the subscription, as serialized header blocks.
     reference_parameters: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Recording:
+    """One recording of an NVR (Profile G): a camera stream kept on its disk."""
+
+    token: str
+    source: str  # the camera name the NVR shows
+    earliest: datetime | None
+    latest: datetime | None
+
+
+def _parse_time(value: str) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def parse_recordings(roots: list[ET.Element]) -> list[Recording]:
+    """Parse GetRecordingSearchResults answers."""
+    recordings = []
+    for root in roots:
+        for info in find_all(root, "RecordingInformation"):
+            source = find(info, "Source")
+            recordings.append(
+                Recording(
+                    token=find_text(info, "RecordingToken"),
+                    source=find_text(source, "Name") if source is not None else "",
+                    earliest=_parse_time(find_text(info, "EarliestRecording")),
+                    latest=_parse_time(find_text(info, "LatestRecording")),
+                )
+            )
+    return recordings
 
 
 def host_port(host: str, port: int | None) -> str:
@@ -540,6 +578,47 @@ class AjaxOnvifClient:
         except OnvifError:  # optional: a refusal here must not block the setup
             return None
         return find_text(root, "Uri") or None
+
+    async def async_find_recordings(self) -> list[Recording]:
+        """List the recordings of an NVR (search service, Profile G)."""
+        url = self.service_url("search")
+        found = await self._call(
+            url,
+            f'<FindRecordings xmlns="{NS_SEARCH}"><Scope/><MaxMatches>64</MaxMatches>'
+            "<KeepAliveTime>PT10S</KeepAliveTime></FindRecordings>",
+        )
+        token = escape(find_text(found, "SearchToken"))
+        roots = []
+        try:
+            for _ in range(10):
+                root = await self._call(
+                    url,
+                    f'<GetRecordingSearchResults xmlns="{NS_SEARCH}"><SearchToken>{token}'
+                    "</SearchToken><MinResults>1</MinResults><MaxResults>64</MaxResults>"
+                    "<WaitTime>PT5S</WaitTime></GetRecordingSearchResults>",
+                )
+                roots.append(root)
+                if find_text(root, "SearchState") in ("Completed", ""):
+                    break
+        finally:
+            with suppress(OnvifError):  # searches also expire by themselves
+                await self._call(
+                    url,
+                    f'<EndSearch xmlns="{NS_SEARCH}"><SearchToken>{token}</SearchToken></EndSearch>',
+                )
+        return parse_recordings(roots)
+
+    async def async_get_replay_uri(self, recording: str) -> str:
+        """Return the RTSP URI that replays a recording (Require: onvif-replay)."""
+        root = await self._call(
+            self.service_url("replay"),
+            f'<GetReplayUri xmlns="{NS_REPLAY}"><StreamSetup><tt:Stream>RTP-Unicast</tt:Stream>'
+            "<tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></StreamSetup>"
+            f"<RecordingToken>{escape(recording)}</RecordingToken></GetReplayUri>",
+        )
+        if not (uri := find_text(root, "Uri")):
+            raise OnvifError(f"{self.host}: no replay URI for {recording}")
+        return uri
 
     async def async_get_topics(self) -> list[str]:
         """Read the event topics the device can send."""

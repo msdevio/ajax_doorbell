@@ -9,6 +9,11 @@ MANUFACTURER: Final = "Ajax Systems"
 
 CONF_RING_DURATION: Final = "ring_duration"
 CONF_CALL_TIMEOUT: Final = "call_timeout"
+CONF_NVR_HOST: Final = "nvr_host"
+CONF_NVR_PORT: Final = "nvr_port"
+CONF_NVR_USERNAME: Final = "nvr_username"
+CONF_NVR_PASSWORD: Final = "nvr_password"
+CONF_VISIT_RETENTION: Final = "visit_retention"
 
 DEFAULT_ONVIF_PORT: Final = 8080
 DEFAULT_RTSP_PORT: Final = 8554
@@ -17,6 +22,8 @@ DEFAULT_USERNAME: Final = "homeassistant"
 DEFAULT_RING_DURATION: Final = 30
 # Safety net: a call nobody hangs up (closed tab, lost phone) ends after this.
 DEFAULT_CALL_TIMEOUT: Final = 300
+# Days of visits (rings, people) listed for replay from the NVR.
+DEFAULT_VISIT_RETENTION: Final = 2
 
 # IEEE OUI of Ajax Systems; the hub shares it, so discovery checks for ONVIF.
 AJAX_OUI: Final = "9c756e"
