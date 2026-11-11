@@ -3,6 +3,7 @@
 #
 #   bash tools/phase0/run_phase0.sh                 # DoorBell at 192.168.128.31
 #   bash tools/phase0/run_phase0.sh --nvr --host <NVR IP> --events 0
+#   bash tools/phase0/run_phase0.sh --cameras --host <NVR IP>   # every camera on the NVR
 #
 # Asks for the ONVIF account created in the Ajax app (password typed hidden, never
 # written to disk or shell history), then runs probe_onvif.py. The report holds
@@ -19,7 +20,12 @@ read -rsp "Mot de passe ONVIF : " ONVIF_PASS
 echo
 
 EXTRA=()
-if [[ " $* " != *" --nvr "* && " $* " != *" --listen "* ]]; then
+if [[ " $* " == *" --cameras "* ]]; then
+  echo "Déroulé : environ 2 min de mesures automatiques (rien à faire), puis l'écran affiche"
+  echo "« MAINTENANT : passe 2 ou 3 fois devant la TurretCam, puis va sonner à la porte »."
+  echo "Tu as alors 3 min. Ne décroche pas dans l'app Ajax."
+  echo
+elif [[ " $* " != *" --nvr "* && " $* " != *" --listen "* ]]; then
   read -rp "Jouer des bips dans le haut-parleur de la sonnette pour tester le micro ? [o/N] " BEEP
   [[ "${BEEP,,}" == o* ]] && EXTRA+=(--beep)
   echo

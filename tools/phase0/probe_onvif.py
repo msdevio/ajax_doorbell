@@ -622,6 +622,7 @@ class Findings:
     replay: str = "not tried"
     beep: str = "not run"
     listen: str = "not run"
+    cameras: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -1507,7 +1508,7 @@ def step_nvr(cam: Onvif, args, f: Findings) -> None:
             "<KeepAliveTime>PT10S</KeepAliveTime></FindEvents>",
         )
         for result in search_results(
-            cam, "GetEventSearchResults", text(search, "SearchToken"), "FindEventResult"
+            cam, "GetEventSearchResults", text(search, "SearchToken"), "Result"
         ):
             topic_node = first(result, "Topic")
             topic = (topic_node.text or "").strip() if topic_node is not None else "?"
@@ -1608,6 +1609,515 @@ def replay_test(args, uri: str, start: dt.datetime) -> str:
         rtsp.close()
 
 
+# ---------------------------------------------------------------------- cameras
+
+ACTION_SYNC = (
+    "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/SetSynchronizationPointRequest"
+)
+DETECTION = re.compile(r"Motion|Object|Pir|Line|SmartSearch", re.I)
+
+
+@dataclass
+class Channel:
+    """One camera as the NVR shows it: profiles, recordings, video sources."""
+
+    group: str
+    name: str = "?"
+    streams: dict[str, str] = field(default_factory=dict)  # quality -> RTSP URI
+    details: dict[str, str] = field(default_factory=dict)  # quality -> encoders
+    sources: set[str] = field(default_factory=set)  # video source tokens
+    recordings: dict[str, str] = field(default_factory=dict)  # quality -> token
+    earliest: dt.datetime | None = None
+    live: str = "not tried"
+    history: str = "not tried"
+    replay: list[str] = field(default_factory=list)
+    mode: str = "?"
+    events: list[str] = field(default_factory=list)
+
+
+def channel_group(token: str) -> str:
+    """'<id>-<mac>-0-main' and '<id>-<mac>-0-main-r' -> '<id>-<mac>-0'."""
+    return re.sub(r"[-_](main|sub)(-r)?$", "", token)
+
+
+def quality_of(token: str) -> str:
+    return "sub" if re.search(r"[-_]sub(-r)?$", token) else "main"
+
+
+def step_channels(cam: Onvif) -> dict[str, Channel]:
+    """Group the NVR's profiles and recordings by camera."""
+    section("Cameras on the NVR")
+    tr2 = 'xmlns="http://www.onvif.org/ver20/media/wsdl"'
+    channels: dict[str, Channel] = {}
+    root = cam.call("media2", f"<GetProfiles {tr2}><Type>All</Type></GetProfiles>")
+    for prof in iter_local(root, "Profiles"):
+        token = prof.get("token", "?")
+        channel = channels.setdefault(channel_group(token), Channel(channel_group(token)))
+        quality = quality_of(token)
+        name = re.sub(r"\s*_?(main|sub)$", "", text(prof, "Name"), flags=re.I).strip()
+        if name:
+            channel.name = name
+        conf = first(prof, "Configurations")
+        source = first(conf, "VideoSource")
+        if source is not None:
+            channel.sources.update(
+                t for t in (source.get("token"), text(source, "SourceToken")) if t
+            )
+        video, audio = first(conf, "VideoEncoder"), first(conf, "AudioEncoder")
+        size = first(video, "Resolution")
+        channel.details[quality] = (
+            f"{text(video, 'Encoding')} {text(size, 'Width')}x{text(size, 'Height')}"
+            if video is not None
+            else "no video"
+        ) + (f", audio {text(audio, 'Encoding')}" if audio is not None else ", no audio")
+        try:
+            uri = cam.call(
+                "media2",
+                f"<GetStreamUri {tr2}><Protocol>RTSP</Protocol>"
+                f"<ProfileToken>{xml_escape(token)}</ProfileToken></GetStreamUri>",
+            )
+            channel.streams[quality] = re.sub(r"//[^/@]+@", "//", text(uri, "Uri"))
+        except OnvifError as err:
+            print(f"GetStreamUri {token}: {err}")
+
+    tse = 'xmlns="http://www.onvif.org/ver10/search/wsdl"'
+    try:
+        found = cam.call(
+            "search",
+            f"<FindRecordings {tse}><Scope/><MaxMatches>32</MaxMatches>"
+            "<KeepAliveTime>PT10S</KeepAliveTime></FindRecordings>",
+        )
+        for rec in search_results(
+            cam, "GetRecordingSearchResults", text(found, "SearchToken"), "RecordingInformation"
+        ):
+            token = text(rec, "RecordingToken")
+            channel = channels.setdefault(channel_group(token), Channel(channel_group(token)))
+            channel.recordings[quality_of(token)] = token
+            if channel.name == "?":
+                channel.name = text(first(rec, "Source"), "Name") or "?"
+            earliest = parse_time(text(rec, "EarliestRecording"))
+            if earliest and (channel.earliest is None or earliest < channel.earliest):
+                channel.earliest = earliest
+    except OnvifError as err:
+        print(f"FindRecordings: {err}")
+    for channel in channels.values():
+        print(
+            f"- {channel.name} [{channel.group}]: streams {channel.details}, "
+            f"recordings {sorted(channel.recordings) or 'none'}"
+            + (f" since {channel.earliest:%Y-%m-%d %H:%M} UTC" if channel.earliest else "")
+            + f", video sources {sorted(channel.sources)}"
+        )
+    return channels
+
+
+def step_recording_jobs(cam: Onvif) -> None:
+    """How the NVR is told to record: retention and recording jobs."""
+    section("Recording configuration and jobs")
+    trc = 'xmlns="http://www.onvif.org/ver10/recording/wsdl"'
+    try:
+        root = cam.call("recording", f"<GetRecordings {trc}/>")
+        for item in iter_local(root, "RecordingItem"):
+            print(
+                f"- recording {text(item, 'RecordingToken')}: retention "
+                f"{text(item, 'MaximumRetentionTime') or '?'}, content '{text(item, 'Content')}', "
+                f"source '{text(first(item, 'Source'), 'Name')}'"
+            )
+            report_only(f"    raw {ET.tostring(item, encoding='unicode')[:1500]}")
+    except OnvifError as err:
+        print(f"GetRecordings: {err}")
+    try:
+        root = cam.call("recording", f"<GetRecordingJobs {trc}/>")
+    except OnvifError as err:
+        print(f"GetRecordingJobs: {err}")
+        return
+    jobs = list(iter_local(root, "JobItem"))
+    print(f"{len(jobs)} recording job(s)")
+    for job in jobs:
+        token = text(job, "JobToken")
+        line = (
+            f"- job {token}: recording {text(job, 'RecordingToken')}, mode {text(job, 'Mode')}, "
+            f"priority {text(job, 'Priority')}"
+        )
+        try:
+            state = cam.call(
+                "recording",
+                f"<GetRecordingJobState {trc}><JobToken>{xml_escape(token)}</JobToken>"
+                "</GetRecordingJobState>",
+            )
+            states = [
+                e.text.strip() for e in iter_local(state, "State") if e.text and e.text.strip()
+            ]
+            line += f", state {' / '.join(states) or '?'}"
+        except OnvifError as err:
+            line += f", state: {err}"
+        print(line)
+        report_only(f"    raw {ET.tostring(job, encoding='unicode')[:1500]}")
+
+
+def history_events(
+    cam: Onvif, token: str, start: dt.datetime, end: dt.datetime, expression: str
+) -> list[tuple[str, str, str]]:
+    """Events the NVR kept for a recording: (time, topic, data)."""
+    tse = 'xmlns="http://www.onvif.org/ver10/search/wsdl"'
+    search_filter = (
+        '<SearchFilter><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" '
+        'xmlns:tns1="http://www.onvif.org/ver10/topics" '
+        'Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">'
+        f"{expression}</wsnt:TopicExpression></SearchFilter>"
+        if expression
+        else "<SearchFilter/>"
+    )
+    search = cam.call(
+        "search",
+        f"<FindEvents {tse}><StartPoint>{onvif_time(start)}</StartPoint>"
+        f"<EndPoint>{onvif_time(end)}</EndPoint>"
+        f"<Scope><tt:IncludedRecordings>{xml_escape(token)}</tt:IncludedRecordings></Scope>"
+        f"{search_filter}<IncludeStartState>true</IncludeStartState>"
+        "<MaxMatches>500</MaxMatches><KeepAliveTime>PT10S</KeepAliveTime></FindEvents>",
+    )
+    found: list[tuple[str, str, str]] = []
+    for result in search_results(
+        cam, "GetEventSearchResults", text(search, "SearchToken"), "Result"
+    ):
+        topic_node = first(result, "Topic")
+        topic = (topic_node.text or "").strip() if topic_node is not None else "?"
+        data = first(result, "Data")
+        items = " ".join(
+            f"{item.get('Name')}={item.get('Value')}"
+            for item in iter_local(result if data is None else data, "SimpleItem")
+        )
+        if text(result, "StartStateEvent") == "true":
+            items += " (state at the start)"
+        found.append((text(result, "Time"), topic, items))
+    return sorted(found)
+
+
+def media_attributes(cam: Onvif, token: str, moment: dt.datetime) -> str:
+    tse = 'xmlns="http://www.onvif.org/ver10/search/wsdl"'
+    try:
+        root = cam.call(
+            "search",
+            f"<GetMediaAttributes {tse}><RecordingTokens>{xml_escape(token)}</RecordingTokens>"
+            f"<Time>{onvif_time(moment)}</Time></GetMediaAttributes>",
+        )
+    except OnvifError as err:
+        return f"error {err}"
+    attributes = first(root, "MediaAttributes")
+    if attributes is None:
+        return "no media at that moment"
+    return f"media {text(attributes, 'From') or '?'} -> {text(attributes, 'Until') or '?'}"
+
+
+def replay_uri(cam: Onvif, token: str) -> str:
+    trp = 'xmlns="http://www.onvif.org/ver10/replay/wsdl"'
+    replay = cam.call(
+        "replay",
+        f"<GetReplayUri {trp}><StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport>"
+        "<tt:Protocol>RTSP</tt:Protocol></tt:Transport></StreamSetup>"
+        f"<RecordingToken>{xml_escape(token)}</RecordingToken></GetReplayUri>",
+    )
+    return re.sub(r"//[^/@]+@", "//", text(replay, "Uri"))
+
+
+def replay_probe(
+    args, uri: str, start: dt.datetime, limit: float = 4.0
+) -> tuple[str, float | None]:
+    """Replay from a moment; return what plays and how far it is from that moment."""
+    parts = urlsplit(uri)
+    try:
+        rtsp = Rtsp(parts.hostname or args.host, parts.port or 554, args.user, args.password)
+    except OSError as err:
+        return f"cannot connect ({err})", None
+    require = {"Require": "onvif-replay"}
+    try:
+        resp = rtsp.request("DESCRIBE", uri, {"Accept": "application/sdp", **require})
+        if resp.status != 200:
+            return f"DESCRIBE refused ({resp.status})", None
+        base = resp.headers.get("content-base", uri)
+        video = [m for m in parse_sdp(resp.body.decode(errors="replace")) if m.kind == "video"]
+        if not video:
+            return "no video track", None
+        setup = rtsp.request(
+            "SETUP",
+            media_url(base, video[0].control),
+            {"Transport": "RTP/AVP/TCP;unicast;interleaved=0-1", **require},
+        )
+        if setup.status != 200:
+            return f"SETUP refused ({setup.status})", None
+        clock = start.astimezone(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+        began = time.monotonic()
+        play = rtsp.request("PLAY", base, {"Range": f"clock={clock}-", **require})
+        if play.status != 200:
+            return f"PLAY refused ({play.status} {play.reason})", None
+        ntp, first_key, size = None, None, 0
+        for _, payload, received in rtsp.read_interleaved(began + limit):
+            if len(payload) < 12:
+                continue
+            size += len(payload)
+            header = 12 + 4 * (payload[0] & 0x0F)
+            if payload[0] & 0x10 and len(payload) >= header + 12:
+                if ntp is None and int.from_bytes(payload[header : header + 2], "big") == 0xABAC:
+                    seconds = int.from_bytes(payload[header + 4 : header + 8], "big")
+                    fraction = int.from_bytes(payload[header + 8 : header + 12], "big")
+                    ntp = dt.datetime(1900, 1, 1, tzinfo=dt.UTC) + dt.timedelta(
+                        seconds=seconds + fraction / 2**32
+                    )
+                header += 4 + 4 * int.from_bytes(payload[header + 2 : header + 4], "big")
+            if first_key is None and 5 in nal_types(payload[header:]):
+                first_key = received - began
+            if ntp is not None and first_key is not None:
+                break
+        with suppress(OSError):
+            rtsp.request("TEARDOWN", base)
+        if ntp is None:
+            return f"nothing timestamped within {limit:.0f} s ({size} bytes)", None
+        delta = (ntp - start).total_seconds()
+        result = f"plays {ntp:%H:%M:%S} UTC ({delta:+.0f} s)"
+        if first_key is not None:
+            result += f", keyframe after {first_key * 1000:.0f} ms"
+        return result, delta
+    except OSError as err:
+        return f"error ({err})", None
+    finally:
+        rtsp.close()
+
+
+def step_live(args, f: Findings, channels: dict[str, Channel]) -> None:
+    """Start each camera's live stream through the NVR."""
+    saved = args.stream
+    args.stream = 4
+    try:
+        for channel in channels.values():
+            uri = channel.streams.get("main") or next(iter(channel.streams.values()), "")
+            if not uri:
+                continue
+            f.startup, f.bitrate = "no keyframe", "?"
+            try:
+                step_stream(args, f, uri)
+                channel.live = f"{f.startup}, {f.bitrate}"
+            except OSError as err:
+                channel.live = f"error ({err})"
+    finally:
+        args.stream = saved
+
+
+REPLAY_MOMENTS = (2, 10, 30, 60, 180, 360)  # minutes ago
+
+
+def step_coverage(cam: Onvif, args, channels: dict[str, Channel]) -> None:
+    """Does each camera record continuously, or only clips around events?"""
+    section("Recordings: continuous or on events?")
+    now = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=cam.offset)
+    for channel in channels.values():
+        token = channel.recordings.get("main") or next(iter(channel.recordings.values()), "")
+        print(f"--- {channel.name}")
+        if not token:
+            print("not recorded by the NVR")
+            channel.mode = "not recorded by the NVR"
+            continue
+        counts = []
+        for label, expression in (
+            ("recording history", "tns1:RecordingHistory//."),
+            ("all events", ""),
+        ):
+            try:
+                found = history_events(cam, token, now - dt.timedelta(hours=6), now, expression)
+            except OnvifError as err:
+                print(f"FindEvents ({label}): {err}")
+                counts.append(f"{label}: error")
+                continue
+            topics: dict[str, int] = {}
+            for _, topic, _ in found:
+                topics[topic] = topics.get(topic, 0) + 1
+            print(f"FindEvents ({label}, last 6 h): {len(found)} result(s) {topics}")
+            for moment, topic, items in found[-6:]:
+                print(f"    {moment} {topic} {items}")
+            for moment, topic, items in found:
+                report_only(f"    all: {moment} {topic} {items}")
+            counts.append(f"{label}: {len(found)}")
+        channel.history = ", ".join(counts)
+        for minutes in (1, 30, 120):
+            moment = now - dt.timedelta(minutes=minutes)
+            print(f"GetMediaAttributes at -{minutes} min: {media_attributes(cam, token, moment)}")
+        try:
+            uri = replay_uri(cam, token)
+        except OnvifError as err:
+            print(f"GetReplayUri: {err}")
+            channel.mode = "no replay"
+            continue
+        deltas: list[float | None] = []
+        for minutes in REPLAY_MOMENTS:
+            asked = now - dt.timedelta(minutes=minutes)
+            if channel.earliest and asked < channel.earliest + dt.timedelta(minutes=1):
+                continue  # before the recording began: a jump would mean nothing
+            result, delta = replay_probe(args, uri, asked)
+            print(f"replay from -{minutes} min ({asked:%H:%M:%S} UTC): {result}")
+            channel.replay.append(f"-{minutes} min: {result}")
+            deltas.append(delta)
+        timed = [d for d in deltas if d is not None]
+        jumps = [d for d in timed if d > 5]
+        empty = len(deltas) - len(timed)
+        if not deltas:
+            channel.mode = "unknown (recording too recent)"
+        elif timed and not jumps and not empty:
+            channel.mode = f"continuous: all {len(timed)} moments play within 5 s"
+        elif jumps or empty:
+            channel.mode = f"clips: {len(jumps)} of {len(deltas)} moments jump to a later clip" + (
+                f", {empty} play nothing" if empty else ""
+            )
+        print(f"=> {channel.name}: {channel.mode}")
+
+
+def step_camera_events(cam: Onvif, seconds: int, channels: dict[str, Channel]) -> None:
+    """Every event of every camera, unfiltered, with recording job states."""
+    section(f"Camera events, up to {seconds} s, no topic filter")
+    tev = 'xmlns="http://www.onvif.org/ver10/events/wsdl"'
+    sub = cam.call(
+        "events",
+        f"<CreatePullPointSubscription {tev}><InitialTerminationTime>PT{seconds + 60}S"
+        "</InitialTerminationTime></CreatePullPointSubscription>",
+    )
+    address = text(first(sub, "SubscriptionReference"), "Address")
+    with suppress(OnvifError):
+        cam.call(address, f"<SetSynchronizationPoint {tev}/>", action=ACTION_SYNC)
+    names = {source: c.name for c in channels.values() for source in c.sources}
+
+    def who(token: str) -> str:
+        if token in names:
+            return names[token]
+        for group, channel in channels.items():
+            if group and group in token:
+                return channel.name
+        return token or "?"
+
+    print(
+        f"\a\n>>> MAINTENANT : passe 2 ou 3 fois devant la TurretCam, puis va sonner à la porte."
+        f"\n>>> Tu as {seconds // 60} min {seconds % 60:02d} s. Ne décroche pas dans l'app Ajax.\n"
+    )
+    began = time.monotonic()
+    end, reminder = began + seconds, began + 30
+    rang_at = seen_at = None
+    rang_on, said = "", False
+    bells: set[str] = set()
+    last: dict[tuple[str, str, str], str] = {}
+    counts: dict[tuple[str, str], list] = {}  # (camera, topic) -> [messages, changes, values]
+    try:
+        while time.monotonic() < end:
+            now = time.monotonic()
+            if rang_at and seen_at and now > max(rang_at, seen_at) + 60:
+                break
+            if now >= reminder:
+                print(
+                    f">>> {int(now - began)} s : sonnerie {'vue' if rang_at else 'pas encore vue'}, "
+                    f"détection de caméra {'vue' if seen_at else 'pas encore vue'}."
+                )
+                reminder += 30
+            try:
+                root = cam.call(
+                    address,
+                    f"<PullMessages {tev}><Timeout>PT5S</Timeout><MessageLimit>64</MessageLimit>"
+                    "</PullMessages>",
+                    action=ACTION_PULL,
+                    timeout=15,
+                )
+            except OnvifError as err:
+                print(f"PullMessages: {err}")
+                time.sleep(1)
+                continue
+            stamp = dt.datetime.now(dt.UTC).strftime("%H:%M:%S")
+            for msg in iter_local(root, "NotificationMessage"):
+                topic_node = first(msg, "Topic")
+                topic = (topic_node.text or "").strip() if topic_node is not None else "?"
+                short = "/".join(part.split(":")[-1] for part in topic.split("/")[-2:])
+                message = first(first(msg, "Message"), "Message")
+                op = message.get("PropertyOperation", "") if message is not None else ""
+                source: dict[str, str] = {}
+                data: dict[str, str] = {}
+                for block, target in (("Source", source), ("Data", data)):
+                    node = first(message, block)
+                    if node is not None:
+                        for item in iter_local(node, "SimpleItem"):
+                            target[item.get("Name") or "?"] = item.get("Value") or ""
+                token = next((v for k, v in source.items() if k != "Rule"), "")
+                camera = who(token)
+                rule = source.get("Rule", "")
+                entry = counts.setdefault((camera, short), [0, 0, set()])
+                entry[0] += 1
+                if "Ring" in topic:
+                    bells.add(camera)
+                state = " ".join(f"{k}={v}" for k, v in sorted(data.items()))
+                if not data or last.get((camera, topic, rule)) == state:
+                    continue
+                last[(camera, topic, rule)] = state
+                entry[1] += 1
+                if len(entry[2]) < 6:
+                    entry[2].add(state)
+                print(
+                    f"{stamp} {camera}: {short} {op} {state}" + (f" (rule {rule})" if rule else "")
+                )
+                if op == "Initialized":
+                    continue
+                active = is_active(data) or bool(data.get("ClassTypes"))
+                if "Ring" in topic and active and rang_at is None:
+                    rang_at, rang_on = time.monotonic(), camera
+                    print(">>> Sonnerie reçue.")
+                elif DETECTION.search(topic) and active and seen_at is None and camera not in bells:
+                    seen_at = time.monotonic()
+                    print(f">>> Détection reçue de {camera}.")
+            if rang_at and seen_at and not said:
+                said = True
+                print(">>> Tout est vu. Encore 60 s pour voir la fin des enregistrements…")
+    finally:
+        with suppress(OnvifError):
+            cam.call(
+                address,
+                '<Unsubscribe xmlns="http://docs.oasis-open.org/wsn/b-2"/>',
+                action=ACTION_UNSUB,
+            )
+    print("summary (camera, topic: messages, changes, values seen):")
+    for (camera, short), (messages, changes, values) in sorted(counts.items()):
+        line = f"{short}: {messages} messages, {changes} changes {sorted(values)}"
+        print(f"    {camera}: {line}")
+        for channel in channels.values():
+            if channel.name == camera:
+                channel.events.append(line)
+    if rang_on:
+        print(f"ring came from: {rang_on}")
+
+
+def run_cameras(cam: Onvif, args, f: Findings) -> None:
+    """The NVR's cameras: inventory, live start, recording mode, events."""
+    channels: dict[str, Channel] = {}
+    for name, step in (
+        ("channels", lambda: channels.update(step_channels(cam))),
+        ("jobs", lambda: step_recording_jobs(cam)),
+        ("live", lambda: step_live(args, f, channels)),
+        ("coverage", lambda: step_coverage(cam, args, channels)),
+    ):
+        try:
+            step()
+        except (OnvifError, OSError, ET.ParseError) as err:
+            f.errors.append(f"{name}: {err}")
+            print(f"!! {name}: {err}")
+    if args.events:
+        try:
+            step_camera_events(cam, args.events, channels)
+        except (OnvifError, OSError, ET.ParseError) as err:
+            f.errors.append(f"events: {err}")
+            print(f"!! events: {err}")
+    for channel in channels.values():
+        f.cameras.append(f"camera {channel.name}: {channel.details}")
+        f.cameras.append(f"    live via NVR  {channel.live}")
+        f.cameras.append(
+            f"    recordings    {sorted(channel.recordings) or 'none'}"
+            + (f" since {channel.earliest:%Y-%m-%d %H:%M} UTC" if channel.earliest else "")
+        )
+        f.cameras.append(f"    NVR history   {channel.history}")
+        f.cameras.append(f"    mode          {channel.mode}")
+        f.cameras += [f"    replay        {line}" for line in channel.replay]
+        f.cameras += [f"    events        {line}" for line in channel.events]
+
+
 # ------------------------------------------------------------------------- main
 
 
@@ -1631,6 +2141,9 @@ def run(args) -> Findings:
     except OSError as err:
         f.errors.append(f"rtsp: {err}")
         print(f"!! rtsp: {err}")
+    if args.cameras:
+        run_cameras(cam, args, f)
+        return f
     if uris and args.stream:
         try:
             step_stream(args, f, uris[0])
@@ -1688,6 +2201,11 @@ def main() -> int:
     )
     parser.add_argument("--nvr", action="store_true", help="query Profile G recording services")
     parser.add_argument(
+        "--cameras",
+        action="store_true",
+        help="NVR: every camera's live start, recording mode (continuous or clips) and events",
+    )
+    parser.add_argument(
         "--listen", type=int, default=0, help="record the doorbell microphone this many seconds"
     )
     parser.add_argument("--report", default="", help="also save the report to this file")
@@ -1716,29 +2234,37 @@ def main() -> int:
         )
         f = run(args)
         section("Summary")
-        print(f"model           {f.model} firmware {f.firmware}")
-        print(f"clock           {f.clock}")
-        print(f"stream URIs     {[hide(u) for u in f.stream_uris] or 'none from ONVIF'}")
-        print(f"snapshot        {hide(f.snapshot) or 'none'}; {f.snapshot_fetch}")
-        print(f"audio codec     {f.audio_codec}")
-        print(f"backchannel     {f.backchannel}")
-        print(f"ring topic      {f.ring_topic}")
-        print(
-            f"ring events     {len(f.ring_seen)} seen"
-            + (f": {f.ring_line or f.ring_seen[0]}" if f.ring_seen else "")
-        )
-        print(f"ring delay      {f.ring_delay}")
-        print(f"pull            {f.pull}")
-        print(f"topic filter    {f.topic_filter}")
-        print(f"event rates     {f.rates}")
-        print(f"audio RTP clock {f.audio_clock or '?'}")
-        print(f"video           {f.bitrate}; {f.gop}; {f.startup}")
-        print(f"profile G       {f.profile_g}")
-        print(f"replay          {f.replay}")
-        print(f"beep            {f.beep}")
-        print(f"listen          {f.listen}")
-        if f.errors:
-            print(f"errors          {f.errors}")
+        if args.cameras:
+            print(f"NVR             {f.model} firmware {f.firmware}")
+            print(f"clock           {f.clock}")
+            for line in f.cameras:
+                print(line)
+            if f.errors:
+                print(f"errors          {f.errors}")
+        else:
+            print(f"model           {f.model} firmware {f.firmware}")
+            print(f"clock           {f.clock}")
+            print(f"stream URIs     {[hide(u) for u in f.stream_uris] or 'none from ONVIF'}")
+            print(f"snapshot        {hide(f.snapshot) or 'none'}; {f.snapshot_fetch}")
+            print(f"audio codec     {f.audio_codec}")
+            print(f"backchannel     {f.backchannel}")
+            print(f"ring topic      {f.ring_topic}")
+            print(
+                f"ring events     {len(f.ring_seen)} seen"
+                + (f": {f.ring_line or f.ring_seen[0]}" if f.ring_seen else "")
+            )
+            print(f"ring delay      {f.ring_delay}")
+            print(f"pull            {f.pull}")
+            print(f"topic filter    {f.topic_filter}")
+            print(f"event rates     {f.rates}")
+            print(f"audio RTP clock {f.audio_clock or '?'}")
+            print(f"video           {f.bitrate}; {f.gop}; {f.startup}")
+            print(f"profile G       {f.profile_g}")
+            print(f"replay          {f.replay}")
+            print(f"beep            {f.beep}")
+            print(f"listen          {f.listen}")
+            if f.errors:
+                print(f"errors          {f.errors}")
     if args.report:
         with open(args.report, "w", encoding="utf-8") as handle:
             handle.write(REPORT.getvalue())
