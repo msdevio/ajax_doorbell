@@ -247,4 +247,4 @@ async def test_user_adds_the_nvr(hass: HomeAssistant, mock_client: MagicMock) ->
     assert result["title"] == "Ajax NVR"
     assert result["data"] == {**ENTRY_DATA, CONF_HOST: "192.168.128.30", "kind": "nvr"}
     assert result["result"].unique_id == "9c:75:6e:00:00:30"
-    assert not result["result"].supports_options  # call settings are the DoorBell's
+    assert result["result"].supports_options  # how long camera detections stay listed

@@ -193,6 +193,29 @@ de côté, et rien ne change pour elle. Le direct venant du NVR passe par le mê
 local que les relectures (`127.0.0.1` uniquement) ; rien n'est stocké dans Home
 Assistant.
 
+### Carte caméra
+
+Ajoute la carte **Ajax Camera** (`custom:ajax-video-card`) et choisis une caméra du
+NVR :
+
+```yaml
+type: custom:ajax-video-card
+camera: camera.jardin
+span: 24h   # chronologie : 1h, 6h ou 24h
+```
+
+Elle montre le direct, une chronologie de ce que le NVR a enregistré (une barre pour
+une caméra en continu, des extraits séparés pour une caméra sur événement) avec un
+repère à chaque détection, et les dernières détections avec une image. Touche la
+chronologie ou une détection pour la revoir depuis le NVR ; **−10 s**, **+10 s** et
+**Direct** permettent de se déplacer. La vidéo passe par le lecteur de Home
+Assistant : les caméras H.265 fonctionnent partout où le navigateur sait lire le
+H.265.
+
+Les options de l'entrée NVR (**Configurer**) règlent combien de jours de détections
+restent listés (2 par défaut). Seules les heures sont gardées ; la vidéo reste sur le
+NVR.
+
 ## Notification avec bouton Décrocher
 
 Importe le blueprint

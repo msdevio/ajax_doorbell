@@ -25,7 +25,14 @@ from homeassistant.helpers.typing import ConfigType
 from .const import DOMAIN, is_nvr_entry
 from .doorbell import AjaxDoorbell
 from .hub import async_setup_nvr_entry, async_unload_nvr_entry
+from .journal import DetectionLog
 from .listen import websocket_listen
+from .nvr_api import (
+    NvrThumbnailView,
+    websocket_nvr_camera,
+    websocket_nvr_replay,
+    websocket_nvr_segments,
+)
 from .onvif import OnvifAuthError, OnvifError
 from .services import async_setup_services
 from .talk import websocket_talk
@@ -34,6 +41,9 @@ from .visits_api import VisitThumbnailView, websocket_replay, websocket_visits
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.CAMERA, Platform.EVENT, Platform.SENSOR]
 CARD_FILE = Path(__file__).parent / "frontend" / "ajax-doorbell-card.js"
 CARD_URL = f"/{DOMAIN}/ajax-doorbell-card.js"
+# The NVR cameras' card lives in its own file: the intercom card stays as it is.
+VIDEO_CARD_FILE = Path(__file__).parent / "frontend" / "ajax-video-card.js"
+VIDEO_CARD_URL = f"/{DOMAIN}/ajax-video-card.js"
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 type AjaxDoorbellConfigEntry = ConfigEntry[AjaxDoorbell]
@@ -46,8 +56,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     websocket_api.async_register_command(hass, websocket_listen)
     websocket_api.async_register_command(hass, websocket_visits)
     websocket_api.async_register_command(hass, websocket_replay)
+    websocket_api.async_register_command(hass, websocket_nvr_camera)
+    websocket_api.async_register_command(hass, websocket_nvr_segments)
+    websocket_api.async_register_command(hass, websocket_nvr_replay)
     if hass.http is not None:
         hass.http.register_view(VisitThumbnailView())
+        hass.http.register_view(NvrThumbnailView())
     await _async_register_card(hass)
     return True
 
@@ -60,9 +74,14 @@ async def _async_register_card(hass: HomeAssistant) -> None:
     if hass.http is None or "frontend" not in hass.config.components:
         return  # no web server (tests, headless): nothing to serve
     content = await hass.async_add_executor_job(CARD_FILE.read_bytes)
+    video = await hass.async_add_executor_job(VIDEO_CARD_FILE.read_bytes)
     await hass.http.async_register_static_paths(
-        [StaticPathConfig(CARD_URL, str(CARD_FILE), cache_headers=True)]
+        [
+            StaticPathConfig(CARD_URL, str(CARD_FILE), cache_headers=True),
+            StaticPathConfig(VIDEO_CARD_URL, str(VIDEO_CARD_FILE), cache_headers=True),
+        ]
     )
+    add_extra_js_url(hass, f"{VIDEO_CARD_URL}?v={hashlib.sha256(video).hexdigest()[:10]}")
     add_extra_js_url(hass, f"{CARD_URL}?v={hashlib.sha256(content).hexdigest()[:10]}")
 
 
@@ -96,3 +115,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: AjaxDoorbellConfigEntry
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await entry.runtime_data.async_shutdown()
     return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: AjaxDoorbellConfigEntry) -> None:
+    """Forget a removed NVR's journal of detections (the DoorBell keeps its behaviour)."""
+    if is_nvr_entry(entry):
+        await DetectionLog(hass, entry.entry_id, 1).async_remove()

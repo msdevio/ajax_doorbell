@@ -90,14 +90,62 @@ class AjaxNvrCamera(AjaxNvrEntity, Camera):
         return await self._hub.async_snapshot(self, width, height)
 
 
+class AjaxNvrReplayCamera(AjaxNvrEntity, Camera):
+    """A camera's recordings, replayed from the NVR at the moment the card picks.
+
+    Nothing is stored: go2rtc plays the NVR's recording through the local relay.
+    """
+
+    _attr_supported_features = CameraEntityFeature.STREAM
+    _attr_translation_key = "replay"
+    _attr_entity_registry_visible_default = False
+
+    def __init__(self, hub: AjaxNvrHub, channel: Channel) -> None:
+        """Initialize the replay camera."""
+        AjaxNvrEntity.__init__(self, hub, channel, "replay")
+        Camera.__init__(self)
+        self._attr_brand = "Ajax"
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the moment being replayed."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self.channel.async_add_replay_listener(self._replay_changed))
+
+    @callback
+    def _replay_changed(self) -> None:
+        # Home Assistant picks a camera's WebRTC provider from its stream source.
+        self.hass.async_create_task(self.async_refresh_providers())
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the moment being replayed."""
+        start = self.channel.replay_start
+        return {"replay_start": start.isoformat() if start else None}
+
+    async def stream_source(self) -> str | None:
+        """Return the local relay URL of the recording at the chosen moment."""
+        start = self.channel.replay_start
+        return self._hub.replay_url(self.channel, start) if start else None
+
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        """Return the recording's picture at the chosen moment."""
+        start = self.channel.replay_start
+        return await self._hub.async_thumbnail(self.channel, start) if start else None
+
+
 def nvr_cameras(hub: AjaxNvrHub) -> list[Camera]:
-    """Return the cameras: main stream, plus the substream (disabled by default)."""
+    """Return the cameras: main stream, substream (disabled), replay (hidden)."""
     entities: list[Camera] = []
     for channel in hub.channels.values():
         if "main" in channel.stream_uris:
             entities.append(AjaxNvrCamera(hub, channel, main=True))
         if "sub" in channel.stream_uris:
             entities.append(AjaxNvrCamera(hub, channel, main=False))
+        if channel.recordings:
+            entities.append(AjaxNvrReplayCamera(hub, channel))
     return entities
 
 

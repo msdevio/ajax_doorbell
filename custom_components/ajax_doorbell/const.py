@@ -17,6 +17,9 @@ CONF_NVR_PORT: Final = "nvr_port"
 CONF_NVR_USERNAME: Final = "nvr_username"
 CONF_NVR_PASSWORD: Final = "nvr_password"
 CONF_VISIT_RETENTION: Final = "visit_retention"
+# Days of camera detections the NVR entry keeps in its journal.
+CONF_DETECTION_RETENTION: Final = "detection_retention"
+DEFAULT_DETECTION_RETENTION: Final = 2
 # What a config entry is: a DoorBell (no kind, as in every earlier version) or an NVR.
 CONF_KIND: Final = "kind"
 KIND_NVR: Final = "nvr"

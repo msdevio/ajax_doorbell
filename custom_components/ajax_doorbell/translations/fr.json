@@ -80,6 +80,15 @@
           "nvr_password": "Laisse vide pour reprendre le compte ONVIF de la DoorBell.",
           "visit_retention": "Nombre de jours de sonneries et de passages listés pour la relecture."
         }
+      },
+      "nvr": {
+        "title": "Détections des caméras",
+        "data": {
+          "detection_retention": "Détections gardées"
+        },
+        "data_description": {
+          "detection_retention": "Combien de jours de mouvements et de personnes restent listés pour chaque caméra, pour les retrouver et les revoir. La vidéo elle-même reste sur le NVR."
+        }
       }
     },
     "error": {

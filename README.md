@@ -173,6 +173,27 @@ The DoorBell keeps its own entry and its direct connection: the NVR entry leaves
 out, and nothing about it changes. Live video from the NVR goes through the same
 local relay as replays (`127.0.0.1` only); nothing is stored in Home Assistant.
 
+### Camera card
+
+Add the **Ajax Camera** card (`custom:ajax-video-card`) and pick one of the NVR's
+cameras:
+
+```yaml
+type: custom:ajax-video-card
+camera: camera.garden
+span: 24h   # timeline: 1h, 6h or 24h
+```
+
+It shows the live stream, a timeline of what the NVR recorded (one bar for a camera
+recorded continuously, separate clips for one recorded on events) with a mark at each
+detection, and the latest detections with a picture. Tap the timeline or a detection
+to replay it from the NVR; **−10 s**, **+10 s** and **Live** move around. Video plays
+in Home Assistant's own player, so H.265 cameras work wherever the browser can play
+H.265.
+
+The NVR entry's options (**Configure**) set how many days of detections stay listed
+(2 by default). Only their times are kept; the video stays on the NVR.
+
 ## Notification with an Answer button
 
 Import the blueprint

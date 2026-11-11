@@ -39,3 +39,5 @@ jobs:
         with:
           node-version: "24"
       - run: node --check custom_components/ajax_doorbell/frontend/ajax-doorbell-card.js
+      - run: node --check custom_components/ajax_doorbell/frontend/ajax-video-card.js
+      - run: node tests/frontend/video_card_smoke.mjs

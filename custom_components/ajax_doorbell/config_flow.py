@@ -32,6 +32,7 @@ from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
 from .const import (
     CONF_CALL_TIMEOUT,
+    CONF_DETECTION_RETENTION,
     CONF_KIND,
     CONF_NVR_HOST,
     CONF_NVR_PASSWORD,
@@ -40,6 +41,7 @@ from .const import (
     CONF_RING_DURATION,
     CONF_VISIT_RETENTION,
     DEFAULT_CALL_TIMEOUT,
+    DEFAULT_DETECTION_RETENTION,
     DEFAULT_ONVIF_PORT,
     DEFAULT_RING_DURATION,
     DEFAULT_USERNAME,
@@ -151,15 +153,13 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry: ConfigEntry) -> AjaxDoorbellOptionsFlow:
-        """Return the options flow."""
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> AjaxDoorbellOptionsFlow | AjaxNvrOptionsFlow:
+        """Return the options flow: the DoorBell's calls, or the NVR's journal."""
+        if is_nvr_entry(config_entry):
+            return AjaxNvrOptionsFlow()
         return AjaxDoorbellOptionsFlow()
-
-    @classmethod
-    @callback
-    def async_supports_options_flow(cls, config_entry: ConfigEntry) -> bool:
-        """Only DoorBells have options (call timings, their NVR)."""
-        return not is_nvr_entry(config_entry)
 
     async def _async_check(
         self, user_input: dict[str, Any]
@@ -474,6 +474,39 @@ class AjaxDoorbellOptionsFlow(OptionsFlowWithReload):
                     vol.Required(
                         CONF_VISIT_RETENTION,
                         default=options.get(CONF_VISIT_RETENTION, DEFAULT_VISIT_RETENTION),
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=1,
+                            max=30,
+                            step=1,
+                            unit_of_measurement="d",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                }
+            ),
+        )
+
+
+class AjaxNvrOptionsFlow(OptionsFlowWithReload):
+    """How long the cameras' detections stay listed; saving reloads the NVR."""
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Show the NVR's options (their own step, apart from the DoorBell's)."""
+        return await self.async_step_nvr()
+
+    async def async_step_nvr(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Ask how many days of detections to keep."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+        options = self.config_entry.options
+        return self.async_show_form(
+            step_id="nvr",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_DETECTION_RETENTION,
+                        default=options.get(CONF_DETECTION_RETENTION, DEFAULT_DETECTION_RETENTION),
                     ): NumberSelector(
                         NumberSelectorConfig(
                             min=1,

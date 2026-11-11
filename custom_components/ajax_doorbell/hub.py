@@ -4,7 +4,8 @@ The NVR re-streams each camera, keeps their recordings (ONVIF Profile G) and
 sends every camera's events on one subscription. Live video reaches go2rtc
 through a small local relay: the NVR marks its tracks "sendrecv", which
 go2rtc ignores, and the relay presents them as received only, as it does for
-replays. Nothing is stored in Home Assistant.
+replays. Replays and their pictures go through the same relay; only the
+times of detections are kept (journal.py). Nothing else is stored.
 
 The DoorBell keeps its own config entry and its direct connection: its
 channel on the NVR is left out here, and none of its code runs for the NVR.
@@ -13,7 +14,7 @@ channel on the NVR is left out here, and none of its code runs for the NVR.
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 import logging
 import re
+import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
@@ -35,6 +37,8 @@ from homeassistant.helpers.event import async_call_later, async_track_time_inter
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_DETECTION_RETENTION,
+    DEFAULT_DETECTION_RETENTION,
     DEFAULT_RTSP_PORT,
     DOMAIN,
     MANUFACTURER,
@@ -51,6 +55,7 @@ from .const import (
 )
 from .doorbell import _OBJECT_CLASSES, Detections, _is_true, _matches, _value, normalize_topic
 from .events import EventStream
+from .journal import DetectionLog
 from .nvr import _ReplayRelay, rewrite_sdp
 from .onvif import (
     AjaxOnvifClient,
@@ -85,6 +90,15 @@ HISTORY_SPAN = timedelta(hours=6)
 NTP_EPOCH = datetime(1900, 1, 1, tzinfo=UTC)
 
 _LIVE_PATH = re.compile(r"^/live/([^/]+)/(main|sub)(/.*)?$")
+_REPLAY_PATH = re.compile(r"^/replay/([^/]+)/(main|sub)/(\d{8}T\d{6}Z)(/.*)?$")
+STAMP = "%Y%m%dT%H%M%SZ"
+# Detections worth a line in the journal (PIR is the DoorBell's).
+JOURNAL_KINDS = ("motion", "person", "vehicle", "pet")
+# Pictures of moments, kept in memory only (about 30 kB each).
+THUMBS = 200
+THUMB_TIMEOUT = 15
+# The NVR's history of a time span is asked again after this many seconds.
+SEGMENTS_TTL = 30
 _MAC = re.compile(r"(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])")
 
 
@@ -136,6 +150,27 @@ def pick_names(candidates: dict[str, dict[str, str]]) -> dict[str, str]:
         count = seen[base.casefold()]
         picked[group] = base if count == 1 else f"{base} {count}"
     return picked
+
+
+def to_segments(
+    changes: list[tuple[datetime, bool]], start: datetime, end: datetime
+) -> list[tuple[datetime, datetime]]:
+    """Turn the NVR's "holds video / does not" changes into spans of video.
+
+    Ajax repeats each change once per track: repeats are ignored.
+    """
+    segments: list[tuple[datetime, datetime]] = []
+    opened: datetime | None = None
+    for moment, on in changes:
+        if on and opened is None:
+            opened = max(moment, start)
+        elif not on and opened is not None:
+            if min(moment, end) > opened:
+                segments.append((opened, min(moment, end)))
+            opened = None
+    if opened is not None and end > opened:
+        segments.append((opened, end))
+    return segments
 
 
 def _toggles(history: list[tuple[datetime, bool]]) -> int:
@@ -244,12 +279,25 @@ class Channel:
     last_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=40))
     last_values: dict[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
     listeners: list[Callable[[], None]] = field(default_factory=list)
+    replay_start: datetime | None = None  # the moment the replay camera plays
+    replay_listeners: list[Callable[[], None]] = field(default_factory=list)
 
     @callback
     def async_add_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
         """Call listener when the recording state or mode changes."""
         self.listeners.append(listener)
         return lambda: self.listeners.remove(listener)
+
+    @callback
+    def async_add_replay_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        """Call listener when the replayed moment changes."""
+        self.replay_listeners.append(listener)
+        return lambda: self.replay_listeners.remove(listener)
+
+    @property
+    def recording_main(self) -> Recording | None:
+        """Return the recording replays and history come from."""
+        return self.recordings.get("main") or next(iter(self.recordings.values()), None)
 
     @callback
     def notify(self) -> None:
@@ -299,6 +347,15 @@ class AjaxNvrHub:
         self._connection_listeners: list[Callable[[], None]] = []
         self._unsubs: list[CALLBACK_TYPE] = []
         self._analysis: asyncio.Task[None] | None = None
+        self.journal = DetectionLog(hass, entry.entry_id, self.retention_days)
+        self._thumbs: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+        self._thumb_lock = asyncio.Lock()
+        self._segments: dict[tuple[str, int, int], tuple[float, list]] = {}
+
+    @property
+    def retention_days(self) -> int:
+        """Return how many days of detections the journal keeps."""
+        return int(self.entry.options.get(CONF_DETECTION_RETENTION, DEFAULT_DETECTION_RETENTION))
 
     # ----------------------------------------------------------------- setup
 
@@ -361,6 +418,10 @@ class AjaxNvrHub:
             }
         for group, name in pick_names({g: c.names for g, c in self.channels.items()}).items():
             self.channels[group].name = name
+        for channel in self.channels.values():
+            if channel.recordings:  # the replay camera needs a moment to stream from
+                channel.replay_start = dt_util.utcnow() - timedelta(minutes=1)
+        await self.journal.async_load()
         with suppress(OnvifError):
             jobs = await client.async_get_recording_jobs()
             self.jobs = {job: channel_group(recording) for job, recording in jobs.items()}
@@ -469,6 +530,61 @@ class AjaxNvrHub:
             return None
         return f"rtsp://127.0.0.1:{self.port}/live/{quote(channel.group, safe='')}/{quality}"
 
+    # ---------------------------------------------------------------- replay
+
+    def replay_url(self, channel: Channel, start: datetime, quality: str = "main") -> str | None:
+        """Return the local relay URL that plays a camera's recording from a moment."""
+        if not channel.recordings or not self.port:
+            return None
+        if quality not in channel.recordings:
+            quality = "main" if "main" in channel.recordings else next(iter(channel.recordings))
+        stamp = start.astimezone(UTC).strftime(STAMP)
+        return (
+            f"rtsp://127.0.0.1:{self.port}/replay/{quote(channel.group, safe='')}/{quality}/{stamp}"
+        )
+
+    @callback
+    def set_replay(self, channel: Channel, start: datetime) -> None:
+        """Point the camera's replay at a moment."""
+        channel.replay_start = start
+        for listener in list(channel.replay_listeners):
+            listener()
+
+    async def async_segments(
+        self, channel: Channel, start: datetime, end: datetime
+    ) -> list[tuple[datetime, datetime]]:
+        """Return the spans of a time range the NVR holds video for."""
+        if (recording := channel.recording_main) is None:
+            return []
+        key = (channel.group, int(start.timestamp()) // 30, int(end.timestamp()) // 30)
+        if (cached := self._segments.get(key)) and time.monotonic() - cached[0] < SEGMENTS_TTL:
+            return cached[1]
+        changes = await self.client.async_find_recording_history(recording.token, start, end)
+        segments = to_segments(changes, start, end)
+        self._segments[key] = (time.monotonic(), segments)
+        while len(self._segments) > 20:
+            self._segments.pop(next(iter(self._segments)))
+        return segments
+
+    async def async_thumbnail(self, channel: Channel, start: datetime) -> bytes | None:
+        """Return a small JPEG of the recording at a moment (kept in memory)."""
+        key = (channel.group, start.astimezone(UTC).strftime(STAMP))
+        if (image := self._thumbs.get(key)) is not None:
+            self._thumbs.move_to_end(key)
+            return image
+        url = self.replay_url(channel, start, "sub")
+        if url is None:
+            return None
+        async with self._thumb_lock:  # one ffmpeg at a time
+            if (image := self._thumbs.get(key)) is not None:
+                return image
+            image = await _grab_frame(url)
+        if image:
+            self._thumbs[key] = image
+            while len(self._thumbs) > THUMBS:
+                self._thumbs.popitem(last=False)
+        return image
+
     async def async_snapshot(
         self, camera: Camera, width: int | None, height: int | None
     ) -> bytes | None:
@@ -485,7 +601,7 @@ class AjaxNvrHub:
         task = asyncio.current_task()
         assert task is not None
         self._relays.add(task)
-        relay = _LiveRelay(self, reader, writer)  # type: ignore[arg-type]
+        relay = _HubRelay(self, reader, writer)  # type: ignore[arg-type]
         try:
             await relay.run()
         except (OSError, asyncio.IncompleteReadError, ValueError, RtspError, TimeoutError) as err:
@@ -554,6 +670,7 @@ class AjaxNvrHub:
                     "data": data,
                 }
             )
+        before = dict(channel.detections.state)
         if _matches(topic, TOPIC_JOB):
             state = (_value(data, "State") or "").strip().lower()
             recording = state in ("active", "partiallyactive")
@@ -570,6 +687,19 @@ class AjaxNvrHub:
             found = {_OBJECT_CLASSES.get(c.strip().lower()) for c in raw.split(",")}
             for key in ("person", "vehicle", "pet"):
                 channel.detections.set(key, key in found, source)
+        if event.operation != "Initialized":
+            self._log_detections(channel, before)
+
+    @callback
+    def _log_detections(self, channel: Channel, before: dict[str, bool]) -> None:
+        """Note in the journal what started, and how long activity lasts."""
+        state = channel.detections.state
+        rising = [kind for kind in JOURNAL_KINDS if state[kind] and not before[kind]]
+        now = dt_util.utcnow()
+        for kind in rising:
+            self.journal.add(channel.group, kind, now)
+        if not rising and any(state[kind] != before[kind] for kind in JOURNAL_KINDS):
+            self.journal.extend(channel.group, now)
 
     # ------------------------------------------------------- recording modes
 
@@ -696,32 +826,98 @@ class AjaxNvrHub:
         )
 
 
-class _LiveRelay(_ReplayRelay):
-    """One client (go2rtc) of a camera's live stream, relayed to the NVR."""
+async def _grab_frame(url: str) -> bytes | None:
+    """Take one small JPEG from an RTSP URL with ffmpeg."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            url,
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=480:-2",
+            "-q:v",
+            "5",
+            "-f",
+            "image2",
+            "-c:v",
+            "mjpeg",
+            "pipe:1",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as err:
+        _LOGGER.debug("ffmpeg unavailable for pictures: %s", err)
+        return None
+    try:
+        async with asyncio.timeout(THUMB_TIMEOUT):
+            image, errors = await process.communicate()
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        _LOGGER.debug("Picture from %s timed out", url)
+        return None
+    if process.returncode or not image:
+        _LOGGER.debug("Picture from %s failed: %s", url, errors.decode(errors="replace")[-200:])
+        return None
+    return image
+
+
+class _HubRelay(_ReplayRelay):
+    """One client (go2rtc, ffmpeg) of a camera's live stream or recording, relayed to the NVR."""
 
     async def _answer(self, line: str, headers: dict[str, str], body: bytes) -> None:
         hub: AjaxNvrHub = self._nvr  # type: ignore[assignment]
         method, url = ([*line.split(" "), "", ""])[:2]
         cseq = headers.get("cseq", "0")
         parts = urlsplit(url)
-        match = _LIVE_PATH.match(parts.path)
+        replay = _REPLAY_PATH.match(parts.path)
+        live = None if replay else _LIVE_PATH.match(parts.path)
+        match = replay or live
         channel = hub.channels.get(unquote(match.group(1))) if match else None
-        if match is None or channel is None or match.group(2) not in channel.stream_uris:
+        if match is None or channel is None:
             self._reply(cseq, "404 Not Found")
             return
-        name, quality, suffix = match.groups()
-        local = f"{parts.scheme}://{parts.netloc}/live/{name}/{quality}"
-        upstream = channel.stream_uris[quality].rstrip("/")
+        name, quality = match.group(1), match.group(2)
+        stamp = ""
+        if replay is not None:
+            stamp, suffix = replay.group(3), replay.group(4)
+            recording = channel.recordings.get(quality) or channel.recording_main
+            if recording is None:
+                self._reply(cseq, "404 Not Found")
+                return
+            try:
+                upstream = (await hub._async_replay_uri(recording.token)).rstrip("/")
+            except OnvifError:
+                self._reply(cseq, "503 Service Unavailable")
+                return
+            local = f"{parts.scheme}://{parts.netloc}/replay/{name}/{quality}/{stamp}"
+        else:
+            if quality not in channel.stream_uris:
+                self._reply(cseq, "404 Not Found")
+                return
+            suffix = match.group(3)
+            upstream = channel.stream_uris[quality].rstrip("/")
+            local = f"{parts.scheme}://{parts.netloc}/live/{name}/{quality}"
         if method == "SETUP" and "tcp" not in headers.get("transport", "").lower():
             self._reply(cseq, "461 Unsupported Transport")  # clients retry over TCP
             return
         # Without go2rtc's backchannel requirement the NVR offers a plain stream:
         # its tracks are marked sendrecv, which the SDP rewrite turns into recvonly.
-        out = {
-            key: value
-            for key, value in headers.items()
-            if key not in ("cseq", "require", "authorization", "content-length")
-        }
+        dropped = ("cseq", "require", "authorization", "content-length")
+        out = {key: value for key, value in headers.items() if key not in dropped}
+        if replay is not None:
+            out.pop("range", None)
+            out["require"] = "onvif-replay"
+            if method == "PLAY":
+                out["range"] = f"clock={stamp}-"
         status, reply, reply_body = await self._forward(
             method, upstream + (suffix or ""), out, body
         )

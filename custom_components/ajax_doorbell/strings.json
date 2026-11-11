@@ -80,6 +80,15 @@
           "nvr_password": "Leave empty to use the DoorBell's ONVIF account.",
           "visit_retention": "How many days of rings and people stay listed for replay."
         }
+      },
+      "nvr": {
+        "title": "Camera detections",
+        "data": {
+          "detection_retention": "Detections kept"
+        },
+        "data_description": {
+          "detection_retention": "How many days of motion and people stay listed for each camera, to find and replay them. The video itself stays on the NVR."
+        }
       }
     },
     "error": {

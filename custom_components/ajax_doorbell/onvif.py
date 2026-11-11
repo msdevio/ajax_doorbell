@@ -683,13 +683,14 @@ class AjaxOnvifClient:
             f'<wsnt:TopicExpression xmlns:wsnt="{NS_WSNT}" '
             f'xmlns:tns1="http://www.onvif.org/ver10/topics" Dialect="{TOPIC_DIALECT}">'
             "tns1:RecordingHistory//.</wsnt:TopicExpression></SearchFilter>"
-            "<IncludeStartState>true</IncludeStartState><MaxMatches>500</MaxMatches>"
+            "<IncludeStartState>true</IncludeStartState><MaxMatches>6000</MaxMatches>"
             "<KeepAliveTime>PT10S</KeepAliveTime></FindEvents>",
         )
         token = escape(find_text(found, "SearchToken"))
         changes: list[tuple[datetime, bool]] = []
         try:
-            for _ in range(10):
+            # A day of clips is a few thousand results (one per change and track).
+            for _ in range(60):
                 root = await self._call(
                     url,
                     f'<GetEventSearchResults xmlns="{NS_SEARCH}"><SearchToken>{token}'
