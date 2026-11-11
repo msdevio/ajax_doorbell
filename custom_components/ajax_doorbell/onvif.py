@@ -112,6 +112,15 @@ class MediaProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileDetails:
+    """What the NVR entry reads from a profile on top of MediaProfile."""
+
+    name: str  # the profile's own Name, not one of its configurations'
+    sources: frozenset[str]  # video source tokens: events name their camera so
+    source_name: str  # the video source configuration's name
+
+
+@dataclass(frozen=True, slots=True)
 class OnvifEvent:
     """One notification from a PullPoint."""
 
@@ -625,25 +634,27 @@ class AjaxOnvifClient:
             raise OnvifError(f"{self.host}: no replay URI for {recording}")
         return uri
 
-    async def async_get_video_sources(self) -> dict[str, set[str]]:
-        """Return the video source tokens of each Media2 profile.
-
-        Events name their camera by one of these (VideoSourceToken).
-        """
+    async def async_get_profile_details(self) -> dict[str, ProfileDetails]:
+        """Return each Media2 profile's own name and its video source."""
         root = await self._call(
             self.service_url("media2"),
             f'<GetProfiles xmlns="{NS_MEDIA2}"><Type>All</Type></GetProfiles>',
         )
-        sources: dict[str, set[str]] = {}
+        details: dict[str, ProfileDetails] = {}
         for node in find_all(root, "Profiles"):
+            own = next((c.text or "" for c in node if local_name(c.tag) == "Name"), "")
             source = find_any(node, "VideoSource", "VideoSourceConfiguration")
-            tokens = (
-                {source.get("token", ""), find_text(source, "SourceToken")}
-                if source is not None
-                else set()
+            tokens: set[str] = set()
+            source_name = ""
+            if source is not None:
+                tokens = {source.get("token", ""), find_text(source, "SourceToken")}
+                source_name = next(
+                    (c.text or "" for c in source if local_name(c.tag) == "Name"), ""
+                ).strip()
+            details[node.get("token", "")] = ProfileDetails(
+                own.strip(), frozenset(t for t in tokens if t), source_name
             )
-            sources[node.get("token", "")] = {token for token in tokens if token}
-        return sources
+        return details
 
     async def async_get_recording_jobs(self) -> dict[str, str]:
         """Return the NVR's recording jobs: job token -> recording token."""

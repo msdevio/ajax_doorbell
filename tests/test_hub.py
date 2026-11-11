@@ -26,6 +26,7 @@ from custom_components.ajax_doorbell.hub import (
     channel_group,
     channel_mac,
     channel_name,
+    pick_names,
     probe_replay,
     recording_mode,
 )
@@ -33,6 +34,7 @@ from custom_components.ajax_doorbell.onvif import (
     DeviceIdentity,
     MediaProfile,
     OnvifEvent,
+    ProfileDetails,
     Recording,
 )
 from homeassistant.components.camera import async_get_stream_source
@@ -96,8 +98,11 @@ def make_nvr_client(host: str = NVR_HOST, rtsp_port: int = 8554) -> MagicMock:
     )
     client.async_get_mac = AsyncMock(return_value=NVR_MAC)
     client.async_get_profiles = AsyncMock(return_value=_profiles())
-    client.async_get_video_sources = AsyncMock(
-        return_value={p.token: {f"{channel_group(p.token)}-v"} for p in _profiles()}
+    client.async_get_profile_details = AsyncMock(
+        return_value={
+            p.token: ProfileDetails(p.name, frozenset({f"{channel_group(p.token)}-v"}), "")
+            for p in _profiles()
+        }
     )
     # The NVR announces another of its addresses: streams are aimed at the configured one.
     client.async_get_stream_uri = AsyncMock(
@@ -170,6 +175,61 @@ def test_tokens() -> None:
     assert channel_mac("camera_1") is None
     assert channel_name("Jardin _main") == "Jardin"
     assert channel_name("Garage_sub") == "Garage"
+
+
+def test_pick_names() -> None:
+    """Names come from the first source that tells the cameras apart."""
+    assert pick_names({"a": {"profile": "Jardin"}, "b": {"profile": "Garage"}}) == {
+        "a": "Jardin",
+        "b": "Garage",
+    }
+    # The NVR kept one camera's old name in its profiles; the recordings have both
+    stale = {
+        "a": {"profile": "camera porte", "recording": "camera porte", "fallback": "x"},
+        "b": {"profile": "Camera Porte", "recording": "camera garage", "fallback": "x"},
+    }
+    assert pick_names(stale) == {"a": "camera porte", "b": "camera garage"}
+    # Nothing tells them apart: numbered
+    same = {
+        "a": {"profile": "camera porte", "recording": "camera porte"},
+        "b": {"profile": "camera porte", "recording": ""},
+        "c": {"profile": "", "recording": ""},
+    }
+    assert pick_names(same) == {"a": "camera porte", "b": "camera porte 2", "c": "Camera 3"}
+    assert pick_names({"a": {"profile": "", "recording": "Jardin"}}) == {"a": "Jardin"}
+
+
+@pytest.mark.usefixtures("no_event_stream", "socket_enabled")
+async def test_cameras_named_by_their_recordings(
+    hass: HomeAssistant, nvr_client: MagicMock, nvr_entry: MockConfigEntry
+) -> None:
+    """Two cameras the profiles name alike get their recordings' names."""
+    other = "HAjEnJZbcI-9c756e111111-0"
+    profiles = [p for p in _profiles() if p.token.startswith(TURRET)]
+    profiles += [
+        MediaProfile(f"{other}-main", "Jardin _main", "H265", 3840, 2160, 20.0),
+        MediaProfile(f"{other}-sub", "Jardin _sub", "H265", 720, 576, 20.0),
+    ]
+    nvr_client.async_get_profiles.return_value = profiles
+    nvr_client.async_get_profile_details.return_value = {
+        p.token: ProfileDetails(p.name, frozenset(), "") for p in profiles
+    }
+    nvr_client.async_find_recordings.return_value = [
+        Recording(f"{TURRET}-main-r", "Jardin", None, None),
+        Recording(f"{other}-main-r", "Garage", None, None),
+    ]
+    nvr_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(nvr_entry.entry_id)
+    await hass.async_block_till_done()
+    hub = nvr_entry.runtime_data
+    assert {c.name for c in hub.channels.values()} == {"Jardin", "Garage"}
+    assert hub.channels[other].names["profile"] == "Jardin"
+    devices = dr.async_get(hass)
+    garage = devices.async_get_device_by_identifier(
+        (DOMAIN, f"{NVR_MAC}_{other}"), nvr_entry.entry_id
+    )
+    assert garage is not None
+    assert garage.name == "Garage"
 
 
 async def test_cameras_get_devices(hass: HomeAssistant, both: MockConfigEntry) -> None:

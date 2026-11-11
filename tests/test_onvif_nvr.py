@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import xml.etree.ElementTree as ET
 
-from custom_components.ajax_doorbell.onvif import AjaxOnvifClient
+from custom_components.ajax_doorbell.onvif import AjaxOnvifClient, ProfileDetails
 
 from .conftest import HOST
 from .test_onvif import FakeSession
@@ -24,24 +24,27 @@ def _reply(body: str) -> tuple[int, bytes]:
     return 200, ENV.format(body).encode()
 
 
-async def test_video_sources() -> None:
-    """Each profile's video source tokens: events name their camera with one of them."""
+async def test_profile_details() -> None:
+    """A profile's own name (not a configuration's) and its video source."""
     session = FakeSession(
         [
             _reply(
                 "<tr2:GetProfilesResponse>"
                 '<tr2:Profiles token="cam-0-main"><tr2:Configurations>'
-                '<tr2:VideoSource token="vsc-1"><tt:SourceToken>cam-0-v</tt:SourceToken>'
-                "</tr2:VideoSource></tr2:Configurations></tr2:Profiles>"
+                '<tr2:VideoSource token="vsc-1"><tt:Name>camera porte</tt:Name>'
+                "<tt:SourceToken>cam-0-v</tt:SourceToken></tr2:VideoSource>"
+                "</tr2:Configurations><tr2:Name>camera garage _main</tr2:Name></tr2:Profiles>"
                 '<tr2:Profiles token="other-0-main"><tr2:Configurations/></tr2:Profiles>'
                 "</tr2:GetProfilesResponse>"
             )
         ]
     )
     client = AjaxOnvifClient(session, HOST, 8080, "u", "p")
-    assert await client.async_get_video_sources() == {
-        "cam-0-main": {"vsc-1", "cam-0-v"},
-        "other-0-main": set(),
+    assert await client.async_get_profile_details() == {
+        "cam-0-main": ProfileDetails(
+            "camera garage _main", frozenset({"vsc-1", "cam-0-v"}), "camera porte"
+        ),
+        "other-0-main": ProfileDetails("", frozenset(), ""),
     }
 
 

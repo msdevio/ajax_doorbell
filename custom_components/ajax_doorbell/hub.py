@@ -59,6 +59,7 @@ from .onvif import (
     OnvifAuthError,
     OnvifError,
     OnvifEvent,
+    ProfileDetails,
     Recording,
     host_port,
 )
@@ -109,6 +110,32 @@ def channel_mac(group: str) -> str | None:
 def channel_name(profile_name: str) -> str:
     """'Jardin _main' -> 'Jardin' (the name given in the Ajax app)."""
     return re.sub(r"\s*_?(main|sub)$", "", profile_name, flags=re.IGNORECASE).strip()
+
+
+# Where a camera's name can come from, most trusted first.
+NAME_SOURCES = ("profile", "recording", "video_source", "fallback")
+
+
+def pick_names(candidates: dict[str, dict[str, str]]) -> dict[str, str]:
+    """Name each camera from the first source that tells them all apart.
+
+    The NVR repeats a camera's name in several places, which can disagree
+    (an old name kept in one of them); duplicates are numbered as a last resort.
+    """
+    for source in NAME_SOURCES:
+        names = {group: names.get(source, "").strip() for group, names in candidates.items()}
+        values = [name.casefold() for name in names.values()]
+        if all(values) and len(set(values)) == len(values):
+            return names
+    picked: dict[str, str] = {}
+    seen: dict[str, int] = {}
+    for index, (group, names) in enumerate(candidates.items(), 1):
+        base = next((names[s].strip() for s in NAME_SOURCES if names.get(s, "").strip()), "")
+        base = base or f"Camera {index}"
+        seen[base.casefold()] = seen.get(base.casefold(), 0) + 1
+        count = seen[base.casefold()]
+        picked[group] = base if count == 1 else f"{base} {count}"
+    return picked
 
 
 def _toggles(history: list[tuple[datetime, bool]]) -> int:
@@ -212,6 +239,7 @@ class Channel:
     recordings: dict[str, Recording] = field(default_factory=dict)
     recording: bool | None = None  # the NVR's recording job, None until it tells
     mode: str = MODE_UNKNOWN
+    names: dict[str, str] = field(default_factory=dict)  # name per source, for diagnostics
     analysis: dict[str, Any] = field(default_factory=dict)
     last_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=40))
     last_values: dict[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
@@ -284,9 +312,9 @@ class AjaxNvrHub:
         with suppress(OnvifError):
             self.mac = await client.async_get_mac()
         profiles = await client.async_get_profiles()
-        sources: dict[str, set[str]] = {}
+        details: dict[str, ProfileDetails] = {}
         with suppress(OnvifError):
-            sources = await client.async_get_video_sources()
+            details = await client.async_get_profile_details()
         doorbells = {
             entry.unique_id
             for entry in self.hass.config_entries.async_entries(DOMAIN)
@@ -300,13 +328,13 @@ class AjaxNvrHub:
                 continue
             channel = self.channels.get(group)
             if channel is None:
-                name = channel_name(profile.name) or f"Camera {len(self.channels) + 1}"
-                channel = self.channels[group] = Channel(group, name, mac, Detections(self.hass))
+                channel = self.channels[group] = Channel(group, "", mac, Detections(self.hass))
             quality = "sub" if is_sub(profile.token) else "main"
             if quality in channel.profiles:
                 continue
             channel.profiles[quality] = profile
-            channel.sources |= sources.get(profile.token, set())
+            if (detail := details.get(profile.token)) is not None:
+                channel.sources |= detail.sources
             try:
                 channel.stream_uris[quality] = self._aim(
                     await client.async_get_stream_uri(profile.token)
@@ -318,6 +346,20 @@ class AjaxNvrHub:
                 channel.recordings.setdefault(
                     "sub" if is_sub(recording.token) else "main", recording
                 )
+        for channel in self.channels.values():
+            main = channel.profiles.get("main") or next(iter(channel.profiles.values()))
+            detail = details.get(main.token)
+            recording = channel.recordings.get("main") or next(
+                iter(channel.recordings.values()), None
+            )
+            channel.names = {
+                "profile": channel_name(detail.name) if detail else "",
+                "recording": recording.source if recording else "",
+                "video_source": channel_name(detail.source_name) if detail else "",
+                "fallback": channel_name(main.name),
+            }
+        for group, name in pick_names({g: c.names for g, c in self.channels.items()}).items():
+            self.channels[group].name = name
         with suppress(OnvifError):
             jobs = await client.async_get_recording_jobs()
             self.jobs = {job: channel_group(recording) for job, recording in jobs.items()}
@@ -618,7 +660,9 @@ class AjaxNvrHub:
                 "cameras": [
                     {
                         "name": channel.name,
+                        "names": channel.names,
                         "group": channel.group,
+                        "profile_tokens": {q: p.token for q, p in channel.profiles.items()},
                         "profiles": {
                             quality: {
                                 "encoding": p.encoding,
