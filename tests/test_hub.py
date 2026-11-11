@@ -232,8 +232,16 @@ async def test_cameras_named_by_their_recordings(
     assert garage.name == "Garage"
 
 
-async def test_cameras_get_devices(hass: HomeAssistant, both: MockConfigEntry) -> None:
+async def test_cameras_get_devices(
+    hass: HomeAssistant, both: MockConfigEntry, caplog: pytest.LogCaptureFixture
+) -> None:
     """Each camera of the NVR gets a device; the DoorBell's channel is left to the DoorBell."""
+    # HA 2026 rejects entities whose device uses the deprecated via_device when it
+    # cannot tell which integration asked: the cameras link to the NVR by device id.
+    assert "via_device" not in caplog.text
+    assert "Error adding entity" not in caplog.text
+    hub = both.runtime_data
+    assert "via_device" not in dict(hub.channel_device_info(hub.channels[TURRET]))
     devices = dr.async_get(hass)
     nvr = devices.async_get_device_by_identifier((DOMAIN, NVR_MAC), both.entry_id)
     assert nvr is not None

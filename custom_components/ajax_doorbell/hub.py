@@ -277,6 +277,7 @@ class AjaxNvrHub:
         )
         self.identity: DeviceIdentity | None = None
         self.mac: str | None = None
+        self.device_id: str | None = None  # the NVR's device, which the cameras hang off
         self.channels: dict[str, Channel] = {}
         self.skipped: dict[str, str] = {}  # channel -> why it has no device here
         self.topics: list[str] = []
@@ -451,8 +452,9 @@ class AjaxNvrHub:
             manufacturer=MANUFACTURER,
             model="Camera",
             name=channel.name,
-            via_device=(DOMAIN, self.unique_base),
         )
+        if self.device_id:
+            info["via_device_id"] = self.device_id
         if channel.mac:
             info["connections"] = {(CONNECTION_NETWORK_MAC, channel.mac)}
         return info
@@ -748,6 +750,12 @@ async def async_setup_nvr_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool
             translation_placeholders={"error": str(err)},
         ) from err
     entry.runtime_data = hub
+    # The NVR's device first, so the cameras can name it as theirs (via_device_id).
+    hub.device_id = (
+        dr.async_get(hass)
+        .async_get_or_create(config_entry_id=entry.entry_id, **dict(hub.device_info))
+        .id
+    )
     await hass.config_entries.async_forward_entry_setups(entry, NVR_PLATFORMS)
     hub.start(entry)
     return True

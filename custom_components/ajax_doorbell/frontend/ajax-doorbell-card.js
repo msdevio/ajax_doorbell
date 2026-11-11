@@ -34,7 +34,7 @@
  * it the card still shows the video and plays the sound.
  */
 
-const CARD_VERSION = "0.4.1";
+const CARD_VERSION = "0.4.2";
 const DOMAIN = "ajax_doorbell";
 
 const KEEPALIVE_MS = 60000; // re-answer during our call: the integration ends unattended calls
