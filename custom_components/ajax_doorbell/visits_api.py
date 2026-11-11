@@ -19,7 +19,7 @@ from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.http import KEY_HASS
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import DOMAIN, is_nvr_entry
 from .nvr import NvrError
 from .talk import _doorbell_for
 
@@ -152,6 +152,8 @@ class VisitThumbnailView(HomeAssistantView):
         hass = request.app[KEY_HASS]
         entry = hass.config_entries.async_get_entry(entry_id)
         if entry is None or entry.domain != DOMAIN or entry.state is not ConfigEntryState.LOADED:
+            raise web.HTTPNotFound
+        if is_nvr_entry(entry):
             raise web.HTTPNotFound
         doorbell: AjaxDoorbell = entry.runtime_data
         visit = doorbell.visits.get(visit_id)

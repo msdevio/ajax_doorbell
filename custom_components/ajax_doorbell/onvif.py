@@ -34,6 +34,7 @@ NS_EVENTS = "http://www.onvif.org/ver10/events/wsdl"
 NS_WSNT = "http://docs.oasis-open.org/wsn/b-2"
 NS_SEARCH = "http://www.onvif.org/ver10/search/wsdl"
 NS_REPLAY = "http://www.onvif.org/ver10/replay/wsdl"
+NS_RECORDING = "http://www.onvif.org/ver10/recording/wsdl"
 
 SERVICES = {
     NS_DEVICE: "device",
@@ -164,6 +165,10 @@ def parse_recordings(roots: list[ET.Element]) -> list[Recording]:
                 )
             )
     return recordings
+
+
+def _onvif_time(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def host_port(host: str, port: int | None) -> str:
@@ -619,6 +624,86 @@ class AjaxOnvifClient:
         if not (uri := find_text(root, "Uri")):
             raise OnvifError(f"{self.host}: no replay URI for {recording}")
         return uri
+
+    async def async_get_video_sources(self) -> dict[str, set[str]]:
+        """Return the video source tokens of each Media2 profile.
+
+        Events name their camera by one of these (VideoSourceToken).
+        """
+        root = await self._call(
+            self.service_url("media2"),
+            f'<GetProfiles xmlns="{NS_MEDIA2}"><Type>All</Type></GetProfiles>',
+        )
+        sources: dict[str, set[str]] = {}
+        for node in find_all(root, "Profiles"):
+            source = find_any(node, "VideoSource", "VideoSourceConfiguration")
+            tokens = (
+                {source.get("token", ""), find_text(source, "SourceToken")}
+                if source is not None
+                else set()
+            )
+            sources[node.get("token", "")] = {token for token in tokens if token}
+        return sources
+
+    async def async_get_recording_jobs(self) -> dict[str, str]:
+        """Return the NVR's recording jobs: job token -> recording token."""
+        root = await self._call(
+            self.service_url("recording"), f'<GetRecordingJobs xmlns="{NS_RECORDING}"/>'
+        )
+        return {
+            find_text(job, "JobToken"): find_text(job, "RecordingToken")
+            for job in find_all(root, "JobItem")
+            if find_text(job, "JobToken")
+        }
+
+    async def async_find_recording_history(
+        self, recording: str, start: datetime, end: datetime
+    ) -> list[tuple[datetime, bool]]:
+        """Return when a recording started and stopped holding video (FindEvents).
+
+        Each item is (time, recording); the first one may be the state at the start.
+        """
+        url = self.service_url("search")
+        found = await self._call(
+            url,
+            f'<FindEvents xmlns="{NS_SEARCH}"><StartPoint>{_onvif_time(start)}</StartPoint>'
+            f"<EndPoint>{_onvif_time(end)}</EndPoint><Scope><tt:IncludedRecordings>"
+            f"{escape(recording)}</tt:IncludedRecordings></Scope><SearchFilter>"
+            f'<wsnt:TopicExpression xmlns:wsnt="{NS_WSNT}" '
+            f'xmlns:tns1="http://www.onvif.org/ver10/topics" Dialect="{TOPIC_DIALECT}">'
+            "tns1:RecordingHistory//.</wsnt:TopicExpression></SearchFilter>"
+            "<IncludeStartState>true</IncludeStartState><MaxMatches>500</MaxMatches>"
+            "<KeepAliveTime>PT10S</KeepAliveTime></FindEvents>",
+        )
+        token = escape(find_text(found, "SearchToken"))
+        changes: list[tuple[datetime, bool]] = []
+        try:
+            for _ in range(10):
+                root = await self._call(
+                    url,
+                    f'<GetEventSearchResults xmlns="{NS_SEARCH}"><SearchToken>{token}'
+                    "</SearchToken><MinResults>1</MinResults><MaxResults>100</MaxResults>"
+                    "<WaitTime>PT5S</WaitTime></GetEventSearchResults>",
+                )
+                for result in find_all(root, "Result"):
+                    moment = _parse_time(find_text(result, "Time"))
+                    data = find(result, "Data")
+                    values = {
+                        item.get("Name"): item.get("Value", "")
+                        for item in find_all(result if data is None else data, "SimpleItem")
+                    }
+                    state = values.get("IsRecording", values.get("IsDataPresent"))
+                    if moment is not None and state is not None:
+                        changes.append((moment, state.strip().lower() in ("true", "1")))
+                if find_text(root, "SearchState") in ("Completed", ""):
+                    break
+        finally:
+            with suppress(OnvifError):
+                await self._call(
+                    url,
+                    f'<EndSearch xmlns="{NS_SEARCH}"><SearchToken>{token}</SearchToken></EndSearch>',
+                )
+        return sorted(changes)
 
     async def async_get_topics(self) -> list[str]:
         """Read the event topics the device can send."""

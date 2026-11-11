@@ -97,14 +97,14 @@ async def test_dhcp_ignores_the_hub(hass: HomeAssistant, mock_client: MagicMock)
     assert result["reason"] == "not_video_device"
 
 
-async def test_dhcp_ignores_the_nvr(hass: HomeAssistant, mock_client: MagicMock) -> None:
-    """The NVR shares the Ajax prefix and ONVIF, but has recording services."""
+async def test_dhcp_offers_the_nvr(hass: HomeAssistant, mock_client: MagicMock) -> None:
+    """The NVR shares the Ajax prefix and ONVIF, plus recording services: offered as an NVR."""
     mock_client.async_get_services.return_value = {"device": "x", "search": "y", "replay": "z"}
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_DHCP}, data=DHCP
     )
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "nvr"
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "nvr"
     mock_client.async_get_services.assert_awaited_with(auth=False)
 
 
@@ -234,12 +234,17 @@ async def test_options_nvr_refuses_the_account(
     assert result["errors"] == {"base": "nvr_invalid_auth"}
 
 
-async def test_user_refuses_the_nvr(hass: HomeAssistant, mock_client: MagicMock) -> None:
-    """The NVR's address is refused: it goes in the DoorBell's options."""
+async def test_user_adds_the_nvr(hass: HomeAssistant, mock_client: MagicMock) -> None:
+    """The NVR's address gets an NVR entry: its cameras will get their devices."""
     mock_client.async_get_services.return_value = {"device": "d", "search": "s", "replay": "r"}
+    mock_client.async_get_mac.return_value = "9c:75:6e:00:00:30"
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {**ENTRY_DATA, CONF_HOST: "192.168.128.30"}
-    )
-    assert result["type"] is FlowResultType.FORM
-    assert result["errors"] == {"base": "is_nvr"}
+    with patch("custom_components.ajax_doorbell.async_setup_entry", return_value=True):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**ENTRY_DATA, CONF_HOST: "192.168.128.30"}
+        )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Ajax NVR"
+    assert result["data"] == {**ENTRY_DATA, CONF_HOST: "192.168.128.30", "kind": "nvr"}
+    assert result["result"].unique_id == "9c:75:6e:00:00:30"
+    assert not result["result"].supports_options  # call settings are the DoorBell's

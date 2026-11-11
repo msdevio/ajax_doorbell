@@ -1,4 +1,4 @@
-# Ajax DoorBell pour Home Assistant
+# Ajax DoorBell & Cameras pour Home Assistant
 
 [English](README.md)
 
@@ -6,6 +6,10 @@ Un interphone local pour l'[Ajax DoorBell](https://ajax.systems/products/doorbel
 vidéo live quasi sans latence, écouter et parler au visiteur, sonnerie en moins d'une
 seconde, état d'appel partagé entre tous les écrans, carte interphone et notification
 avec un bouton **Décrocher**.
+
+Ajoute aussi le NVR Ajax : chaque autre caméra qu'il enregistre a son propre
+appareil, avec la vidéo en direct, les mouvements et les personnes, et le mode
+d'enregistrement (continu ou sur événement).
 
 Tout reste sur ton réseau. L'intégration parle à la DoorBell par son interface
 officielle ONVIF et RTSP : ni cloud Ajax, ni mot de passe du compte Ajax.
@@ -166,6 +170,28 @@ relais dans l'intégration, sur `127.0.0.1` uniquement, permet au go2rtc de Home
 Assistant de lire l'enregistrement du NVR ; les images en sont tirées à l'affichage
 et gardées en mémoire. Il faut le go2rtc intégré à Home Assistant (le cas par
 défaut).
+
+## Caméras enregistrées par le NVR Ajax
+
+Ajoute le NVR comme une entrée à part : Home Assistant le propose quand il le voit
+sur le réseau (**Paramètres → Appareils et services**, « Découverts »), ou ajoute de
+nouveau l'intégration en saisissant l'adresse du NVR. Son compte ONVIF est celui créé
+sur le NVR dans l'app Ajax ; si les options de la DoorBell l'utilisent déjà, laisse le
+mot de passe vide.
+
+Chaque caméra que le NVR enregistre a alors son propre appareil, au nom donné dans
+l'app Ajax :
+
+- une entité caméra avec le direct (le sous-flux existe aussi, désactivé) ;
+- les détections mouvement, personne, véhicule et animal ;
+- **Enregistrement en cours** : allumé tant que le NVR enregistre la caméra ;
+- **Mode d'enregistrement** (diagnostic) : *Continu* ou *Sur événement*, mesuré sur
+  les enregistrements du NVR peu après l'ajout puis toutes les six heures.
+
+La DoorBell garde sa propre entrée et sa connexion directe : l'entrée NVR la laisse
+de côté, et rien ne change pour elle. Le direct venant du NVR passe par le même relais
+local que les relectures (`127.0.0.1` uniquement) ; rien n'est stocké dans Home
+Assistant.
 
 ## Notification avec bouton Décrocher
 

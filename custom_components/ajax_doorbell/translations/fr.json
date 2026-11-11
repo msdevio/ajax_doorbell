@@ -3,8 +3,8 @@
     "flow_title": "{name}",
     "step": {
       "user": {
-        "title": "Ajax DoorBell",
-        "description": "Utilise un compte ONVIF créé dans l'app Ajax : Appareils → DoorBell → Paramètres → Service → Connexion via ONVIF → Utilisateurs ONVIF. Le rôle Opérateur suffit.",
+        "title": "Ajax DoorBell & Cameras",
+        "description": "Adresse de la DoorBell, ou du NVR Ajax pour ajouter les caméras qu'il enregistre. Utilise un compte ONVIF créé dans l'app Ajax : Appareils → DoorBell (ou NVR) → Paramètres → Service → Connexion via ONVIF → Utilisateurs ONVIF. Le rôle Opérateur suffit.",
         "data": {
           "host": "Hôte",
           "username": "Utilisateur ONVIF",
@@ -12,24 +12,32 @@
           "port": "Port ONVIF"
         },
         "data_description": {
-          "host": "Adresse IP de la DoorBell sur ton réseau. Réserve-lui une adresse fixe dans ton routeur.",
-          "username": "Pas ton compte Ajax : l'utilisateur ONVIF local de la DoorBell.",
-          "port": "8080, sauf si tu l'as changé dans l'app Ajax. Le port RTSP est lu sur la DoorBell."
+          "host": "Adresse IP de la DoorBell ou du NVR sur ton réseau. Réserve-lui une adresse fixe dans ton routeur.",
+          "username": "Pas ton compte Ajax : l'utilisateur ONVIF local de l'appareil.",
+          "port": "8080, sauf si tu l'as changé dans l'app Ajax. Le port RTSP est lu sur l'appareil."
         }
       },
       "reauth_confirm": {
         "title": "Compte ONVIF refusé",
-        "description": "La DoorBell ({host}) a refusé le compte ONVIF. Saisis-le à nouveau, ou crée-en un nouveau dans l'app Ajax.",
+        "description": "L'appareil ({host}) a refusé le compte ONVIF. Saisis-le à nouveau, ou crée-en un nouveau dans l'app Ajax.",
         "data": {
           "username": "Utilisateur ONVIF",
           "password": "Mot de passe ONVIF"
         }
       },
       "reconfigure": {
-        "title": "Changer l'adresse de la DoorBell",
+        "title": "Changer l'adresse",
         "data": {
           "host": "Hôte",
           "port": "Port ONVIF"
+        }
+      },
+      "nvr": {
+        "title": "NVR Ajax",
+        "description": "NVR Ajax trouvé à l'adresse {host}. Chaque caméra qu'il enregistre aura son propre appareil ; la DoorBell garde sa propre entrée. Saisis le compte ONVIF du NVR (app Ajax : NVR → Paramètres → Service → Connexion via ONVIF). Si tu l'as déjà saisi dans les options de la DoorBell, laisse le mot de passe vide.",
+        "data": {
+          "username": "Utilisateur ONVIF",
+          "password": "Mot de passe ONVIF"
         }
       }
     },
@@ -37,10 +45,12 @@
       "cannot_connect": "Appareil injoignable. Vérifie l'adresse et que l'ONVIF est activé dans l'app Ajax.",
       "invalid_auth": "L'appareil refuse ce compte ONVIF.",
       "no_profiles": "L'appareil répond en ONVIF mais ne partage aucun flux vidéo avec ce compte.",
-      "is_nvr": "C'est l'adresse du NVR Ajax. Ajoute ici la DoorBell elle-même, puis indique l'adresse du NVR dans ses options (Configurer)."
+      "is_nvr": "C'est l'adresse du NVR Ajax, pas celle de cette DoorBell.",
+      "not_nvr": "Cette adresse n'est pas celle d'un NVR Ajax (aucun enregistrement).",
+      "password_required": "Saisis le mot de passe ONVIF : aucune DoorBell ne l'a enregistré pour ce NVR."
     },
     "abort": {
-      "already_configured": "Cette DoorBell est déjà configurée.",
+      "already_configured": "Cet appareil est déjà configuré.",
       "nvr": "C'est un enregistreur (NVR) Ajax, pas une DoorBell.",
       "not_video_device": "Cet appareil Ajax n'a pas de service ONVIF (probablement un hub).",
       "reauth_successful": "Le compte ONVIF fonctionne de nouveau.",
@@ -101,6 +111,9 @@
       },
       "event_stream": {
         "name": "Flux d'événements"
+      },
+      "recording": {
+        "name": "Enregistrement en cours"
       }
     },
     "camera": {
@@ -137,6 +150,15 @@
       },
       "missed_calls": {
         "name": "Appels manqués"
+      },
+      "recording_mode": {
+        "name": "Mode d'enregistrement",
+        "state": {
+          "continuous": "Continu",
+          "clips": "Sur événement",
+          "unknown": "Inconnu",
+          "not_recorded": "Non enregistrée"
+        }
       }
     }
   },

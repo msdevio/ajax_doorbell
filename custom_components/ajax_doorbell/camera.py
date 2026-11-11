@@ -7,8 +7,10 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import AjaxDoorbellConfigEntry
+from .const import is_nvr_entry
 from .doorbell import AjaxDoorbell
 from .entity import AjaxDoorbellEntity
+from .hub_entities import nvr_cameras
 from .onvif import MediaProfile
 
 try:  # Home Assistant 2026.11 and later
@@ -25,6 +27,9 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add the main stream camera, plus the substream (disabled by default)."""
+    if is_nvr_entry(entry):
+        async_add_entities(nvr_cameras(entry.runtime_data))
+        return
     doorbell = entry.runtime_data
     assert doorbell.main_profile is not None
     entities: list[Camera] = [AjaxDoorbellCamera(doorbell, doorbell.main_profile, main=True)]

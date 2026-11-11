@@ -1,6 +1,6 @@
 {
   "domain": "ajax_doorbell",
-  "name": "Ajax DoorBell",
+  "name": "Ajax DoorBell & Cameras",
   "after_dependencies": [
     "frontend",
     "go2rtc",
@@ -23,5 +23,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/msdevio/ajax_doorbell/issues",
   "requirements": [],
-  "version": "0.3.1"
+  "version": "0.4.0"
 }

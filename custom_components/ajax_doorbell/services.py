@@ -9,7 +9,7 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.service import async_extract_config_entry_ids
 
-from .const import DOMAIN
+from .const import DOMAIN, is_nvr_entry
 from .doorbell import AjaxDoorbell
 
 ATTR_ANSWERED_BY = "answered_by"
@@ -25,7 +25,11 @@ ANSWER_SCHEMA = TARGET_SCHEMA.extend({vol.Optional(ATTR_ANSWERED_BY): cv.string}
 
 async def _async_doorbells(call: ServiceCall) -> list[AjaxDoorbell]:
     """Resolve the target; no target means every DoorBell."""
-    entries = call.hass.config_entries.async_loaded_entries(DOMAIN)
+    entries = [
+        entry
+        for entry in call.hass.config_entries.async_loaded_entries(DOMAIN)
+        if not is_nvr_entry(entry)  # an NVR has no calls
+    ]
     if any(call.data.get(key) for key in cv.TARGET_SERVICE_FIELDS):
         wanted = await async_extract_config_entry_ids(call)
         entries = [entry for entry in entries if entry.entry_id in wanted]

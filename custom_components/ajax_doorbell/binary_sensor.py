@@ -16,8 +16,10 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import AjaxDoorbellConfigEntry
 from .call import CallState
+from .const import is_nvr_entry
 from .doorbell import AjaxDoorbell
 from .entity import AjaxDoorbellEntity
+from .hub_entities import nvr_binary_sensors
 
 PARALLEL_UPDATES = 0
 
@@ -82,6 +84,9 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add the binary sensors this device supports."""
+    if is_nvr_entry(entry):
+        async_add_entities(nvr_binary_sensors(entry.runtime_data))
+        return
     doorbell = entry.runtime_data
     async_add_entities(
         AjaxBinarySensor(doorbell, description)

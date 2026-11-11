@@ -16,7 +16,9 @@ from homeassistant.util import dt as dt_util
 
 from . import AjaxDoorbellConfigEntry
 from .call import CallState
+from .const import is_nvr_entry
 from .entity import AjaxDoorbellEntity
+from .hub_entities import nvr_sensors
 
 PARALLEL_UPDATES = 0
 
@@ -27,6 +29,9 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add the call sensors when the device is a doorbell."""
+    if is_nvr_entry(entry):
+        async_add_entities(nvr_sensors(entry.runtime_data))
+        return
     doorbell = entry.runtime_data
     if not doorbell.is_doorbell:
         return

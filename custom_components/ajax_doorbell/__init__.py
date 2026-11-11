@@ -1,8 +1,9 @@
-"""Ajax DoorBell: a local intercom for Home Assistant.
+"""Ajax DoorBell & Cameras: a local intercom and NVR cameras for Home Assistant.
 
 Live video and listening go through Home Assistant's go2rtc over the doorbell's
 own RTSP stream; talk-back goes from the card to the doorbell's audio
 backchannel through this integration; rings arrive as local ONVIF events.
+An Ajax NVR added on its own brings the other cameras it records (hub.py).
 Nothing goes through the Ajax cloud.
 """
 
@@ -21,8 +22,9 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN
+from .const import DOMAIN, is_nvr_entry
 from .doorbell import AjaxDoorbell
+from .hub import async_setup_nvr_entry, async_unload_nvr_entry
 from .listen import websocket_listen
 from .onvif import OnvifAuthError, OnvifError
 from .services import async_setup_services
@@ -65,7 +67,9 @@ async def _async_register_card(hass: HomeAssistant) -> None:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: AjaxDoorbellConfigEntry) -> bool:
-    """Connect to the DoorBell and start listening to it."""
+    """Connect to the DoorBell and start listening to it (or to the NVR)."""
+    if is_nvr_entry(entry):
+        return await async_setup_nvr_entry(hass, entry)
     doorbell = AjaxDoorbell(hass, entry)
     try:
         await doorbell.async_initialize()
@@ -87,6 +91,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: AjaxDoorbellConfigEntry)
 
 async def async_unload_entry(hass: HomeAssistant, entry: AjaxDoorbellConfigEntry) -> bool:
     """Stop listening and remove the entities."""
+    if is_nvr_entry(entry):
+        return await async_unload_nvr_entry(hass, entry)
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await entry.runtime_data.async_shutdown()
     return unloaded

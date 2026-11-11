@@ -26,7 +26,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import Unauthorized
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 
-from .const import DOMAIN
+from .const import DOMAIN, is_nvr_entry
 from .rtsp import (
     REQUIRE_BACKCHANNEL,
     RtspConnection,
@@ -219,6 +219,8 @@ def _doorbell_for(hass: HomeAssistant, entity_id: str) -> AjaxDoorbell | None:
     entry = hass.config_entries.async_get_entry(entry_id) if entry_id else None
     if entry is None or entry.domain != DOMAIN or not hasattr(entry, "runtime_data"):
         return None
+    if is_nvr_entry(entry):
+        return None  # a camera of the NVR: no call, no talk-back
     return entry.runtime_data
 
 

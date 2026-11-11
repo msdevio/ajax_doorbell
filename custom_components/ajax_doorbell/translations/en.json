@@ -3,8 +3,8 @@
     "flow_title": "{name}",
     "step": {
       "user": {
-        "title": "Ajax DoorBell",
-        "description": "Use an ONVIF account created in the Ajax app: Devices → DoorBell → Settings → Service → Connection via ONVIF → ONVIF users. The Operator role is enough.",
+        "title": "Ajax DoorBell & Cameras",
+        "description": "Address of the DoorBell, or of the Ajax NVR to add the cameras it records. Use an ONVIF account created in the Ajax app: Devices → DoorBell (or NVR) → Settings → Service → Connection via ONVIF → ONVIF users. The Operator role is enough.",
         "data": {
           "host": "Host",
           "username": "ONVIF username",
@@ -12,24 +12,32 @@
           "port": "ONVIF port"
         },
         "data_description": {
-          "host": "IP address of the DoorBell on your network. Give it a fixed lease in your router.",
-          "username": "Not your Ajax account: the local ONVIF user of the DoorBell.",
-          "port": "8080 unless you changed it in the Ajax app. The RTSP port is read from the DoorBell."
+          "host": "IP address of the DoorBell or of the NVR on your network. Give it a fixed lease in your router.",
+          "username": "Not your Ajax account: the local ONVIF user of the device.",
+          "port": "8080 unless you changed it in the Ajax app. The RTSP port is read from the device."
         }
       },
       "reauth_confirm": {
         "title": "ONVIF account refused",
-        "description": "The DoorBell at {host} refused the ONVIF account. Enter it again, or create a new one in the Ajax app.",
+        "description": "The device at {host} refused the ONVIF account. Enter it again, or create a new one in the Ajax app.",
         "data": {
           "username": "ONVIF username",
           "password": "ONVIF password"
         }
       },
       "reconfigure": {
-        "title": "Change the DoorBell address",
+        "title": "Change the address",
         "data": {
           "host": "Host",
           "port": "ONVIF port"
+        }
+      },
+      "nvr": {
+        "title": "Ajax NVR",
+        "description": "Ajax NVR found at {host}. Each camera it records gets its own device; the DoorBell keeps its own entry. Enter the NVR's ONVIF account (Ajax app: NVR → Settings → Service → Connection via ONVIF). If you already entered it in the DoorBell's options, leave the password empty.",
+        "data": {
+          "username": "ONVIF username",
+          "password": "ONVIF password"
         }
       }
     },
@@ -37,10 +45,12 @@
       "cannot_connect": "Cannot reach the device. Check the address and that ONVIF is enabled in the Ajax app.",
       "invalid_auth": "The device refused this ONVIF account.",
       "no_profiles": "The device answers ONVIF but shares no video stream with this account.",
-      "is_nvr": "This is the Ajax NVR's address. Add the DoorBell itself here, then enter the NVR's address in the DoorBell's options (Configure)."
+      "is_nvr": "This is the Ajax NVR's address, not this DoorBell's.",
+      "not_nvr": "This address is not an Ajax NVR (no recordings).",
+      "password_required": "Enter the ONVIF password: no DoorBell has it saved for this NVR."
     },
     "abort": {
-      "already_configured": "This DoorBell is already set up.",
+      "already_configured": "This device is already set up.",
       "nvr": "This is an Ajax NVR, not a DoorBell.",
       "not_video_device": "This Ajax device has no ONVIF service (probably a hub).",
       "reauth_successful": "The ONVIF account works again.",
@@ -101,6 +111,9 @@
       },
       "event_stream": {
         "name": "Event stream"
+      },
+      "recording": {
+        "name": "Recording"
       }
     },
     "camera": {
@@ -137,6 +150,15 @@
       },
       "missed_calls": {
         "name": "Missed calls"
+      },
+      "recording_mode": {
+        "name": "Recording mode",
+        "state": {
+          "continuous": "Continuous",
+          "clips": "On events",
+          "unknown": "Unknown",
+          "not_recorded": "Not recorded"
+        }
       }
     }
   },

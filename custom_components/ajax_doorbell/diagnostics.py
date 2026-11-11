@@ -10,6 +10,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
 from . import AjaxDoorbellConfigEntry
+from .const import is_nvr_entry
 from .rtsp import strip_credentials
 
 TO_REDACT = {
@@ -34,6 +35,11 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: AjaxDoorbellConfigEntry
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
+    if is_nvr_entry(entry):
+        return {
+            "entry": async_redact_data({"data": dict(entry.data)}, TO_REDACT),
+            "nvr": entry.runtime_data.as_diagnostics(),
+        }
     doorbell = entry.runtime_data
     call = doorbell.call
     description = doorbell.description

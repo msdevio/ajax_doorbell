@@ -1,4 +1,4 @@
-# Ajax DoorBell for Home Assistant
+# Ajax DoorBell & Cameras for Home Assistant
 
 [Français](README.fr.md)
 
@@ -6,6 +6,9 @@ A local intercom for the [Ajax DoorBell](https://ajax.systems/products/doorbell/
 video with near-zero latency, listen and talk to the visitor, a ring event within a
 second, a shared call state across every screen, an intercom card and a notification
 with an **Answer** button.
+
+Add the Ajax NVR too, and every other camera it records gets its own device: live
+video, motion and people, and whether it records continuously or on events.
 
 Everything stays on your network. The integration talks to the DoorBell over its
 official ONVIF and RTSP interface: no Ajax cloud, no Ajax account password.
@@ -150,6 +153,25 @@ Nothing is recorded or stored by Home Assistant: the video stays on the NVR. A s
 relay inside the integration, on `127.0.0.1` only, lets Home Assistant's go2rtc play
 the NVR's recording, and pictures are taken from it when shown and kept in memory.
 This needs Home Assistant's built-in go2rtc (the default).
+
+## Cameras recorded by the Ajax NVR
+
+Add the NVR as its own entry: Home Assistant offers it when it sees it on the network
+(**Settings → Devices & services**, "Discovered"), or add the integration again and
+type the NVR's address. Its ONVIF account is the one created on the NVR in the Ajax
+app; if the DoorBell's options already use it, leave the password empty.
+
+Every camera the NVR records then gets its own device, named as in the Ajax app:
+
+- a camera entity with the live stream (the substream is there too, disabled);
+- motion, person, vehicle and pet detections;
+- **Recording**: on while the NVR records the camera;
+- **Recording mode** (diagnostic): *Continuous* or *On events*, measured on the
+  NVR's recordings shortly after setup and every six hours.
+
+The DoorBell keeps its own entry and its direct connection: the NVR entry leaves it
+out, and nothing about it changes. Live video from the NVR goes through the same
+local relay as replays (`127.0.0.1` only); nothing is stored in Home Assistant.
 
 ## Notification with an Answer button
 

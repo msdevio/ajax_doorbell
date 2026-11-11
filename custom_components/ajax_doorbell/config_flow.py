@@ -1,4 +1,4 @@
-"""Config flow: find the DoorBell, check its ONVIF account, keep its address."""
+"""Config flow: find the DoorBell (or the NVR), check its ONVIF account, keep its address."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
 from .const import (
     CONF_CALL_TIMEOUT,
+    CONF_KIND,
     CONF_NVR_HOST,
     CONF_NVR_PASSWORD,
     CONF_NVR_PORT,
@@ -44,7 +45,9 @@ from .const import (
     DEFAULT_USERNAME,
     DEFAULT_VISIT_RETENTION,
     DOMAIN,
+    KIND_NVR,
     TOPIC_RING,
+    is_nvr_entry,
 )
 from .doorbell import normalize_topic
 from .nvr import NvrError, pick_recordings
@@ -57,7 +60,11 @@ PORT = vol.All(vol.Coerce(int), vol.Range(min=1, max=65535))
 
 
 class NvrAddressError(Exception):
-    """The address is the NVR's: it belongs in the DoorBell's options."""
+    """The address is the NVR's: it gets an NVR entry, with its cameras."""
+
+
+class NotNvrError(Exception):
+    """The device has no recording services: it is not an NVR."""
 
 
 class NoProfilesError(Exception):
@@ -105,6 +112,22 @@ async def async_probe(
     return ProbeResult(identity, mac, doorbell)
 
 
+async def async_probe_nvr(
+    hass: HomeAssistant, host: str, port: int, username: str, password: str
+) -> tuple[DeviceIdentity, str | None]:
+    """Log in to an NVR and read its identity and MAC address."""
+    client = AjaxOnvifClient(async_get_clientsession(hass), host, port, username, password)
+    await client.async_update_time_offset()
+    services = await client.async_get_services()
+    if not {"search", "replay"} <= services.keys():
+        raise NotNvrError
+    identity = await client.async_get_identity()
+    mac = None
+    with suppress(OnvifError):
+        mac = await client.async_get_mac()
+    return identity, mac
+
+
 def _user_schema(host: str | None) -> vol.Schema:
     return vol.Schema(
         {
@@ -132,6 +155,12 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
         """Return the options flow."""
         return AjaxDoorbellOptionsFlow()
 
+    @classmethod
+    @callback
+    def async_supports_options_flow(cls, config_entry: ConfigEntry) -> bool:
+        """Only DoorBells have options (call timings, their NVR)."""
+        return not is_nvr_entry(config_entry)
+
     async def _async_check(
         self, user_input: dict[str, Any]
     ) -> tuple[ProbeResult | None, dict[str, str]]:
@@ -154,12 +183,51 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
             return None, {"base": "cannot_connect"}
         return result, {}
 
+    async def _async_check_nvr(self, data: dict[str, Any]) -> tuple[str | None, dict[str, str]]:
+        """Return the NVR's unique id, or the errors to show."""
+        try:
+            identity, mac = await async_probe_nvr(
+                self.hass,
+                data[CONF_HOST],
+                data[CONF_PORT],
+                data[CONF_USERNAME],
+                data[CONF_PASSWORD],
+            )
+        except OnvifAuthError:
+            return None, {"base": "invalid_auth"}
+        except NotNvrError:
+            return None, {"base": "not_nvr"}
+        except OnvifError as err:
+            _LOGGER.debug("Cannot reach the NVR at %s: %s", data[CONF_HOST], err)
+            return None, {"base": "cannot_connect"}
+        return (format_mac(mac) if mac else self._mac or identity.serial), {}
+
+    async def _async_finish_nvr(self, unique_id: str, data: dict[str, Any]) -> ConfigFlowResult:
+        await self.async_set_unique_id(unique_id, raise_on_progress=False)
+        self._abort_if_unique_id_configured(
+            updates={CONF_HOST: data[CONF_HOST], CONF_PORT: data[CONF_PORT]}
+        )
+        return self.async_create_entry(title="Ajax NVR", data={**data, CONF_KIND: KIND_NVR})
+
+    def _known_nvr_account(self, host: str) -> tuple[str, str] | None:
+        """Return the account a DoorBell's options already use for this NVR."""
+        for entry in self._async_current_entries(include_ignore=False):
+            options = entry.options
+            if is_nvr_entry(entry) or (options.get(CONF_NVR_HOST) or "").strip() != host:
+                continue
+            return (
+                options.get(CONF_NVR_USERNAME) or entry.data[CONF_USERNAME],
+                options.get(CONF_NVR_PASSWORD) or entry.data[CONF_PASSWORD],
+            )
+        return None
+
     async def async_step_dhcp(self, discovery_info: DhcpServiceInfo) -> ConfigFlowResult:
         """Handle a device with the Ajax MAC prefix.
 
         The hub shares the prefix but has no ONVIF service: an unauthenticated
         clock request tells the two apart without needing any account. The NVR
-        has ONVIF too, but also the recording services a DoorBell lacks.
+        has ONVIF too, but also the recording services a DoorBell lacks: it is
+        offered as an NVR, whose cameras each get a device.
         """
         mac = format_mac(discovery_info.macaddress)
         await self.async_set_unique_id(mac)
@@ -175,9 +243,10 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
             services = await client.async_get_services(auth=False)
         except OnvifError:
             services = {}  # some firmwares want an account here: offer the device
-        if {"search", "replay"} & services.keys():
-            return self.async_abort(reason="nvr")
         self._host, self._mac = discovery_info.ip, mac
+        if {"search", "replay"} & services.keys():
+            self.context["title_placeholders"] = {"name": f"Ajax NVR ({discovery_info.ip})"}
+            return await self.async_step_nvr()
         self.context["title_placeholders"] = {"name": f"Ajax ({discovery_info.ip})"}
         return await self.async_step_user()
 
@@ -187,6 +256,11 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             user_input[CONF_HOST] = user_input[CONF_HOST].strip()
             result, errors = await self._async_check(user_input)
+            if errors.get("base") == "is_nvr":
+                # The NVR's address: it gets its own entry, and its cameras their devices.
+                unique_id, errors = await self._async_check_nvr(user_input)
+                if unique_id is not None:
+                    return await self._async_finish_nvr(unique_id, user_input)
             if result is not None:
                 unique_id = (
                     format_mac(result.mac) if result.mac else self._mac or result.identity.serial
@@ -207,6 +281,42 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
             )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
+    async def async_step_nvr(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Add the NVR found on the network, with its ONVIF account."""
+        assert self._host is not None
+        known = self._known_nvr_account(self._host)
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            username = user_input[CONF_USERNAME].strip()
+            password = user_input.get(CONF_PASSWORD) or ""
+            if not password and known and known[0] == username:
+                password = known[1]  # the one saved in the DoorBell's options
+            data = {
+                CONF_HOST: self._host,
+                CONF_USERNAME: username,
+                CONF_PASSWORD: password,
+                CONF_PORT: DEFAULT_ONVIF_PORT,
+            }
+            if not password:
+                errors["base"] = "password_required"
+            else:
+                unique_id, errors = await self._async_check_nvr(data)
+                if unique_id is not None:
+                    return await self._async_finish_nvr(unique_id, data)
+        return self.async_show_form(
+            step_id="nvr",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_USERNAME, default=known[0] if known else DEFAULT_USERNAME
+                    ): str,
+                    vol.Optional(CONF_PASSWORD): PASSWORD,
+                }
+            ),
+            description_placeholders={"host": self._host},
+            errors=errors,
+        )
+
     async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> ConfigFlowResult:
         """The DoorBell refused the account."""
         return await self.async_step_reauth_confirm()
@@ -218,7 +328,10 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
         entry = self._get_reauth_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
-            _, errors = await self._async_check({**entry.data, **user_input})
+            if is_nvr_entry(entry):
+                _, errors = await self._async_check_nvr({**entry.data, **user_input})
+            else:
+                _, errors = await self._async_check({**entry.data, **user_input})
             if not errors:
                 return self.async_update_reload_and_abort(entry, data_updates=user_input)
         return self.async_show_form(
@@ -243,7 +356,15 @@ class AjaxDoorbellConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             user_input[CONF_HOST] = user_input[CONF_HOST].strip()
-            result, errors = await self._async_check({**entry.data, **user_input})
+            if is_nvr_entry(entry):
+                unique_id, errors = await self._async_check_nvr({**entry.data, **user_input})
+                if unique_id is not None:
+                    await self.async_set_unique_id(unique_id)
+                    self._abort_if_unique_id_mismatch(reason="wrong_device")
+                    return self.async_update_reload_and_abort(entry, data_updates=user_input)
+                result = None
+            else:
+                result, errors = await self._async_check({**entry.data, **user_input})
             if result is not None:
                 if result.mac:
                     await self.async_set_unique_id(format_mac(result.mac))
